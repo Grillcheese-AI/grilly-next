@@ -208,6 +208,23 @@ def cube_to_vsa(state, size=3, dim=10240):
 VSACache = _core.VSACache if NATIVE_AVAILABLE else None
 
 
+# ── CubeMind: TextEncoder ────────────────────────────────────────────────
+
+TextEncoder = _core.TextEncoder if NATIVE_AVAILABLE else None
+
+
+# ── CubeMind: SemanticAssigner (Memoized LSH Projection Cache) ──────────
+
+SemanticAssigner = _core.SemanticAssigner if NATIVE_AVAILABLE else None
+
+
+# ── Training Pipeline (Producer-Consumer) ────────────────────────────────
+
+ParsedDocument = _core.ParsedDocument if NATIVE_AVAILABLE else None
+TrainingPayload = _core.TrainingPayload if NATIVE_AVAILABLE else None
+TrainingPipeline = _core.TrainingPipeline if NATIVE_AVAILABLE else None
+
+
 # ── OpGraph ──────────────────────────────────────────────────────────────
 
 OpGraph = _core.OpGraph if NATIVE_AVAILABLE else None

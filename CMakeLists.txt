@@ -144,11 +144,15 @@ add_library(grilly_core_lib STATIC
     cpp/src/cubemind/cube.cpp
     cpp/src/cubemind/cache.cpp
     cpp/src/cubemind/text_encoder.cpp
+    cpp/src/cubemind/semantic_assigner.cpp
+    cpp/src/cubemind/resonator.cpp
+    cpp/src/training/pipeline.cpp
     cpp/src/autograd.cpp
 )
 
 target_include_directories(grilly_core_lib PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${VMA_INCLUDE_DIR}"
 )
 

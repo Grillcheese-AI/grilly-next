@@ -48,15 +48,17 @@ BitpackedVec TextEncoder::encode_sentence(
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         // 1. Get semantic filler (pre-projected FastText → bipolar)
+        //    Lazy caching: if token isn't in the map, generate BLAKE3
+        //    fallback and cache it for all future lookups.
         const std::vector<int8_t>* word_vec = nullptr;
         auto it = semantic_fillers_.find(tokens[i]);
-        std::vector<int8_t> fallback;
         if (it != semantic_fillers_.end()) {
             word_vec = &it->second;
         } else {
-            // Unknown token → deterministic BLAKE3 fallback
-            fallback = fallback_filler(tokens[i]);
-            word_vec = &fallback;
+            // Unknown token → deterministic BLAKE3 fallback, cached on first miss
+            auto [inserted_it, _] = semantic_fillers_.emplace(
+                tokens[i], fallback_filler(tokens[i]));
+            word_vec = &inserted_it->second;
         }
 
         // 2. Get structural role vector (BLAKE3 deterministic hash)

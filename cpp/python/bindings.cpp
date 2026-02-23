@@ -30,6 +30,9 @@
 #include "grilly/cubemind/cube.h"
 #include "grilly/cubemind/cache.h"
 #include "grilly/cubemind/text_encoder.h"
+#include "grilly/cubemind/semantic_assigner.h"
+#include "grilly/cubemind/resonator.h"
+#include "grilly/training/pipeline.h"
 #include "grilly/autograd/autograd.h"
 
 namespace py = pybind11;
@@ -1649,6 +1652,270 @@ PYBIND11_MODULE(grilly_core, m) {
         .def("vocab_size", &grilly::cubemind::TextEncoder::vocab_size)
         .def_property_readonly("dim", &grilly::cubemind::TextEncoder::dim)
         .def_property_readonly("ft_dim", &grilly::cubemind::TextEncoder::ft_dim);
+
+    // ── CubeMind: SemanticAssigner (Memoized LSH Projection Cache) ──────
+
+    py::class_<grilly::cubemind::SemanticAssigner>(m, "SemanticAssigner")
+        .def(py::init<uint32_t, uint32_t>(),
+             py::arg("dim") = 10240, py::arg("ft_dim") = 300)
+        .def("get_semantic_filler",
+             [](grilly::cubemind::SemanticAssigner& sa,
+                const std::string& token) -> py::dict {
+                 auto packed = sa.get_semantic_filler(token);
+                 py::dict d;
+                 d["data"] = py::array_t<uint32_t>(
+                     packed.data.size(), packed.data.data());
+                 d["dim"] = packed.dim;
+                 d["num_words"] = packed.numWords();
+                 return d;
+             },
+             py::arg("token"))
+        .def("add_float_vector",
+             [](grilly::cubemind::SemanticAssigner& sa,
+                const std::string& token,
+                py::array_t<float> vec) {
+                 auto buf = vec.request();
+                 sa.add_float_vector(token, static_cast<const float*>(buf.ptr));
+             },
+             py::arg("token"), py::arg("vec"))
+        .def("add_float_vectors_batch",
+             [](grilly::cubemind::SemanticAssigner& sa,
+                const std::vector<std::string>& tokens,
+                py::array_t<float> vectors) {
+                 auto buf = vectors.request();
+                 sa.add_float_vectors_batch(
+                     tokens, static_cast<const float*>(buf.ptr));
+             },
+             py::arg("tokens"), py::arg("vectors"))
+        .def("prewarm", &grilly::cubemind::SemanticAssigner::prewarm)
+        .def("add_bipolar_filler",
+             [](grilly::cubemind::SemanticAssigner& sa,
+                const std::string& token,
+                py::array_t<int8_t> bipolar) {
+                 auto buf = bipolar.request();
+                 std::vector<int8_t> vec(
+                     static_cast<int8_t*>(buf.ptr),
+                     static_cast<int8_t*>(buf.ptr) + buf.size);
+                 sa.add_bipolar_filler(token, vec);
+             },
+             py::arg("token"), py::arg("bipolar"))
+        .def("load_fillers",
+             &grilly::cubemind::SemanticAssigner::load_fillers,
+             py::arg("path"))
+        .def("project_to_bipolar",
+             [](const grilly::cubemind::SemanticAssigner& sa,
+                py::array_t<float> vec) -> py::array_t<int8_t> {
+                 auto buf = vec.request();
+                 auto result = sa.project_to_bipolar(
+                     static_cast<const float*>(buf.ptr));
+                 return py::array_t<int8_t>(result.size(), result.data());
+             },
+             py::arg("vec"))
+        .def_property_readonly("cache_size",
+             &grilly::cubemind::SemanticAssigner::cache_size)
+        .def_property_readonly("float_vocab_size",
+             &grilly::cubemind::SemanticAssigner::float_vocab_size)
+        .def_property_readonly("cache_hits",
+             &grilly::cubemind::SemanticAssigner::cache_hits)
+        .def_property_readonly("cache_misses",
+             &grilly::cubemind::SemanticAssigner::cache_misses)
+        .def_property_readonly("hit_rate",
+             &grilly::cubemind::SemanticAssigner::hit_rate)
+        .def("reset_stats",
+             &grilly::cubemind::SemanticAssigner::reset_stats)
+        .def_property_readonly("dim",
+             &grilly::cubemind::SemanticAssigner::dim)
+        .def_property_readonly("ft_dim",
+             &grilly::cubemind::SemanticAssigner::ft_dim);
+
+    // ── CubeMind: ResonatorNetwork (GPU Hamming Similarity Generation) ──
+
+    py::class_<grilly::cubemind::ResonatorNetwork>(m, "ResonatorNetwork")
+        .def(py::init(
+                 [](GrillyCoreContext& ctx, uint32_t dim) {
+                     return new grilly::cubemind::ResonatorNetwork(
+                         ctx.pool, ctx.batch, ctx.cache, dim);
+                 }),
+             py::arg("device"), py::arg("dim") = 10240,
+             py::keep_alive<1, 2>())
+        .def("load_codebook",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                const std::vector<std::string>& words,
+                py::array_t<uint32_t> vectors) {
+                 auto buf = vectors.request();
+                 res.load_codebook(words,
+                     static_cast<const uint32_t*>(buf.ptr));
+             },
+             py::arg("words"), py::arg("vectors"))
+        .def("load_codebook_bipolar",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                const std::vector<std::string>& words,
+                py::array_t<int8_t> vectors) {
+                 auto buf = vectors.request();
+                 res.load_codebook_bipolar(words,
+                     static_cast<const int8_t*>(buf.ptr));
+             },
+             py::arg("words"), py::arg("vectors"))
+        .def("resonate",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> query_packed,
+                bool return_all) -> py::dict {
+                 auto buf = query_packed.request();
+                 grilly::cubemind::BitpackedVec q;
+                 q.dim = res.codebook_size() > 0 ? 10240 : 0;
+                 q.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 q.dim = q.data.size() * 32;
+
+                 auto result = res.resonate(q, return_all);
+
+                 py::dict d;
+                 d["best_index"] = result.best_index;
+                 d["best_similarity"] = result.best_similarity;
+                 d["best_word"] = res.get_word(result.best_index);
+                 if (return_all) {
+                     d["similarities"] = py::array_t<float>(
+                         result.all_similarities.size(),
+                         result.all_similarities.data());
+                 }
+                 return d;
+             },
+             py::arg("query_packed"), py::arg("return_all") = false)
+        .def("generate_sentence",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> bundle_packed,
+                std::vector<std::string> dependency_roles,
+                std::vector<uint32_t> positions,
+                bool explain_away) -> py::list {
+                 auto buf = bundle_packed.request();
+                 grilly::cubemind::BitpackedVec bundle;
+                 bundle.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 bundle.dim = bundle.data.size() * 32;
+
+                 auto result = res.generate_sentence(
+                     bundle, dependency_roles, positions, explain_away);
+
+                 py::list out;
+                 for (auto& [word, sim] : result) {
+                     py::dict entry;
+                     entry["word"] = word;
+                     entry["similarity"] = sim;
+                     out.append(entry);
+                 }
+                 return out;
+             },
+             py::arg("bundle_packed"),
+             py::arg("dependency_roles"),
+             py::arg("positions"),
+             py::arg("explain_away") = true)
+        .def_property_readonly("codebook_size",
+             &grilly::cubemind::ResonatorNetwork::codebook_size)
+        .def("get_word",
+             &grilly::cubemind::ResonatorNetwork::get_word,
+             py::arg("index"))
+        .def_property_readonly("total_resonations",
+             &grilly::cubemind::ResonatorNetwork::total_resonations)
+        .def_property_readonly("last_resonate_ms",
+             &grilly::cubemind::ResonatorNetwork::last_resonate_ms);
+
+    // ── Training Pipeline: Producer-Consumer Data Loading ───────────────
+
+    py::class_<grilly::training::ParsedDocument>(m, "ParsedDocument")
+        .def(py::init<>())
+        .def_readwrite("tokens",
+                        &grilly::training::ParsedDocument::tokens)
+        .def_readwrite("dependency_roles",
+                        &grilly::training::ParsedDocument::dependency_roles)
+        .def_readwrite("positions",
+                        &grilly::training::ParsedDocument::positions)
+        .def_readwrite("llm_token_ids",
+                        &grilly::training::ParsedDocument::llm_token_ids);
+
+    py::class_<grilly::TrainingPayload>(m, "TrainingPayload")
+        .def(py::init<>())
+        .def_property_readonly("vsa_data",
+             [](const grilly::TrainingPayload& p) -> py::array_t<uint32_t> {
+                 return py::array_t<uint32_t>(
+                     p.vsa_state.data.size(), p.vsa_state.data.data());
+             })
+        .def_property_readonly("vsa_dim",
+             [](const grilly::TrainingPayload& p) { return p.vsa_state.dim; })
+        .def_readwrite("llm_input_tokens",
+                        &grilly::TrainingPayload::llm_input_tokens)
+        .def_readwrite("sequence_id",
+                        &grilly::TrainingPayload::sequence_id)
+        .def_property_readonly("surprise",
+             [](const grilly::TrainingPayload& p) {
+                 return p.emotion.surprise;
+             })
+        .def_property_readonly("stress",
+             [](const grilly::TrainingPayload& p) {
+                 return p.emotion.stress;
+             });
+
+    py::class_<grilly::training::TrainingPipeline>(m, "TrainingPipeline")
+        .def(py::init<uint32_t, uint32_t, size_t>(),
+             py::arg("dim") = 10240,
+             py::arg("ft_dim") = 300,
+             py::arg("queue_depth") = 1024)
+        .def("start",
+             [](grilly::training::TrainingPipeline& pipe,
+                const std::vector<grilly::training::ParsedDocument>& docs) {
+                 pipe.start(docs);
+             },
+             py::arg("documents"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("start_with_files",
+             [](grilly::training::TrainingPipeline& pipe,
+                const std::vector<std::string>& paths) {
+                 pipe.start_with_files(paths);
+             },
+             py::arg("paths"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("pop",
+             [](grilly::training::TrainingPipeline& pipe) -> py::object {
+                 grilly::TrainingPayload payload;
+                 bool ok;
+                 {
+                     py::gil_scoped_release release;
+                     ok = pipe.pop(payload);
+                 }
+                 if (!ok) return py::none();
+                 return py::cast(std::move(payload));
+             })
+        .def("try_pop",
+             [](grilly::training::TrainingPipeline& pipe) -> py::object {
+                 grilly::TrainingPayload payload;
+                 if (!pipe.try_pop(payload)) return py::none();
+                 return py::cast(std::move(payload));
+             })
+        .def("stop", &grilly::training::TrainingPipeline::stop,
+             py::call_guard<py::gil_scoped_release>())
+        .def("join", &grilly::training::TrainingPipeline::join,
+             py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("queue_size",
+             &grilly::training::TrainingPipeline::queue_size)
+        .def("encoder",
+             &grilly::training::TrainingPipeline::encoder,
+             py::return_value_policy::reference_internal)
+        .def("assigner",
+             &grilly::training::TrainingPipeline::assigner,
+             py::return_value_policy::reference_internal)
+        .def("stats",
+             [](const grilly::training::TrainingPipeline& pipe) -> py::dict {
+                 auto s = pipe.stats();
+                 py::dict d;
+                 d["documents_encoded"] = s.documents_encoded;
+                 d["payloads_consumed"] = s.payloads_consumed;
+                 d["queue_current_size"] = s.queue_current_size;
+                 d["encoding_docs_per_sec"] = s.encoding_docs_per_sec;
+                 d["elapsed_seconds"] = s.elapsed_seconds;
+                 d["producer_busy_pct"] = s.producer_busy_pct;
+                 return d;
+             });
 
     // ── Autograd: TapeArena + Wengert List Backward Engine ──────────────
 
