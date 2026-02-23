@@ -7,7 +7,7 @@ import pytest
 
 try:
     from grilly import Compute, SNNCompute
-    from grilly.backend.base import VULKAN_AVAILABLE
+    from grilly.backend import VULKAN_AVAILABLE
 except ImportError:
     pytest.skip("grilly not available", allow_module_level=True)
 

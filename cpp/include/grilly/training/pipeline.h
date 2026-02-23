@@ -24,6 +24,12 @@ struct ParsedDocument {
     std::vector<std::string> dependency_roles;    // spaCy dep labels
     std::vector<uint32_t> positions;              // Token positions
     std::vector<uint32_t> llm_token_ids;          // Token IDs for LLM embedding
+
+    // SVC triple from pre-parsed linguistic analysis.
+    // Extracted from JSONL "svc": {"s": "dog", "v": "be", "c": "animal"}
+    std::string svc_subject;
+    std::string svc_verb;
+    std::string svc_complement;
 };
 
 /// Pipeline statistics for monitoring throughput.

@@ -110,6 +110,7 @@ void BackwardEngine::dispatch_node_backward(Node* node) {
         case OpType::CrossEntropy: backward_cross_entropy(node); break;
         case OpType::MSELoss:   backward_mse(node); break;
         case OpType::CubeMindSurprise: backward_cubemind_surprise(node); break;
+        case OpType::TemporalSurprise: backward_temporal_surprise(node); break;
         case OpType::Reshape:   backward_reshape(node); break;
         case OpType::Transpose: backward_transpose(node); break;
         case OpType::Sum:       backward_sum(node); break;
@@ -440,6 +441,42 @@ void BackwardEngine::backward_cubemind_surprise(Node* node) {
 
         // Store the multiplier in params for the scalar-multiply shader.
         // The actual dispatch uses: output[i] = input[i] * multiplier
+        std::memcpy(node->params, &multiplier, sizeof(float));
+        node->params_size = sizeof(float);
+
+        node->grad_input_buffers[0] = node->grad_output_buffer;
+        // TODO: dispatch scalar-multiply shader with push constant `multiplier`
+        stats_.shaders_dispatched++;
+    }
+}
+
+void BackwardEngine::backward_temporal_surprise(Node* node) {
+    // Temporal Foresight: modulate gradient by counterfactual contradiction.
+    //
+    // During the forward pass, N counterfactual branches were evaluated:
+    //   - Each branch: erase actual fact, insert "what if" fact, shift T+dt
+    //   - Each branch checked against the WorldModel via Hamming search
+    //
+    // The TemporalSurpriseParams (stored in node->params) contain:
+    //   avg_contradiction: mean surprise across all branches (0 = coherent, 1 = nonsense)
+    //   temporal_multiplier: pre-computed 1.0 - 2.0 * avg_contradiction
+    //
+    // Gradient modulation:
+    //   If futures are coherent (low contradiction) → multiplier ~1.0 (pass through)
+    //   If futures are contradictory (high contradiction) → multiplier < 0 (penalize)
+    //   The negative multiplier pushes weights AWAY from the incoherent trajectory.
+
+    TemporalSurpriseParams tparams;
+    std::memcpy(&tparams, node->params, sizeof(TemporalSurpriseParams));
+
+    if (node->inputs[0].requires_grad) {
+        float multiplier = tparams.temporal_multiplier * tparams.alpha;
+
+        // Clamp to [-1, 1] to prevent gradient explosion
+        if (multiplier > 1.0f) multiplier = 1.0f;
+        if (multiplier < -1.0f) multiplier = -1.0f;
+
+        // Store multiplier for scalar-multiply shader
         std::memcpy(node->params, &multiplier, sizeof(float));
         node->params_size = sizeof(float);
 

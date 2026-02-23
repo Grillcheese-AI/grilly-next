@@ -58,3 +58,6 @@ src/grilly/_version.py
 *.zip
 NUL
 _build/
+
+# Local archive (planning docs, design notes — kept locally, not pushed)
+archive/

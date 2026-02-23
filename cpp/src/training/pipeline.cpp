@@ -111,6 +111,9 @@ void DataLoader::worker_loop() {
         payload.emotion = {0.0f, 0.0f};  // Surprise computed by consumer
         payload.sequence_id = sequence_counter_.fetch_add(
             1, std::memory_order_relaxed);
+        payload.svc_subject = doc.svc_subject;
+        payload.svc_verb = doc.svc_verb;
+        payload.svc_complement = doc.svc_complement;
 
         // ── Push to queue (may block if at capacity = backpressure) ─────
         if (!queue_.push(std::move(payload))) {
@@ -167,6 +170,9 @@ void DataLoader::worker_loop_files() {
             payload.emotion = {0.0f, 0.0f};
             payload.sequence_id = sequence_counter_.fetch_add(
                 1, std::memory_order_relaxed);
+            payload.svc_subject = std::move(doc.svc_subject);
+            payload.svc_verb = std::move(doc.svc_verb);
+            payload.svc_complement = std::move(doc.svc_complement);
 
             // ── Push to queue (backpressure if at capacity) ──────────
             if (!queue_.push(std::move(payload))) {

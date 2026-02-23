@@ -18,6 +18,12 @@ struct TrainingPayload {
     std::vector<uint32_t> llm_input_tokens;     // Token IDs for LLM embedding
     cubemind::EmotionState emotion;             // Cached for pre-computed surprise
     uint64_t sequence_id;                       // Monotonic ordering for debugging
+
+    // SVC triple for WorldModel coherence checks.
+    // Carried from ParsedDocument through the queue to the consumer.
+    std::string svc_subject;
+    std::string svc_verb;
+    std::string svc_complement;
 };
 
 /// Bounded, thread-safe MPSC (Multi-Producer, Single-Consumer) queue.

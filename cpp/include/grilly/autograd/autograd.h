@@ -127,8 +127,30 @@ enum class OpType : uint8_t {
     // CubeMind — Surprise-Momentum optimizer hook
     CubeMindSurprise,
 
+    // CubeMind — Temporal Foresight (counterfactual contradiction penalty)
+    TemporalSurprise,
+
     _Count  // sentinel
 };
+
+// ── TemporalSurpriseParams ────────────────────────────────────────────
+//
+// Packed into Node::params[64] for TemporalSurprise nodes.
+// Stores counterfactual evaluation results computed during the forward pass.
+// The backward pass reads these to compute the gradient multiplier.
+//
+// Memory: 24 bytes (fits comfortably in the 64-byte params buffer).
+//
+struct TemporalSurpriseParams {
+    float avg_coherence;        // Mean coherence across N counterfactual branches
+    float avg_contradiction;    // Mean surprise (contradiction) across branches
+    float temporal_multiplier;  // Pre-computed: 1.0 - 2*avg_contradiction
+    float alpha;                // Sensitivity scaling (default 1.0)
+    uint32_t num_branches;      // Number of counterfactual branches evaluated
+    uint32_t dt;                // Time steps projected forward
+};
+static_assert(sizeof(TemporalSurpriseParams) <= 64,
+              "TemporalSurpriseParams must fit in Node::params[64]");
 
 // ── Node ────────────────────────────────────────────────────────────────
 //
@@ -268,6 +290,7 @@ private:
     void backward_cross_entropy(Node* node);
     void backward_mse(Node* node);
     void backward_cubemind_surprise(Node* node);
+    void backward_temporal_surprise(Node* node);
 
     // Shape ops — no shader needed, just reshape the gradient buffer
     void backward_reshape(Node* node);

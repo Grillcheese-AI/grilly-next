@@ -18,7 +18,7 @@ def pytest_configure(config):
 
 try:
     import grilly
-    from grilly.backend.base import VULKAN_AVAILABLE
+    from grilly.backend import VULKAN_AVAILABLE
 
     GRILLY_AVAILABLE = True
 except ImportError:

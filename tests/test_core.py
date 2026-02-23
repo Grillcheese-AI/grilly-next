@@ -7,7 +7,7 @@ import pytest
 
 try:
     import grilly
-    from grilly.backend.base import VULKAN_AVAILABLE
+    from grilly.backend import VULKAN_AVAILABLE
 
     GRILLY_AVAILABLE = True
 except ImportError:
@@ -43,7 +43,7 @@ class TestGrillyImports:
 
     def test_vulkan_available_flag(self):
         """Test VULKAN_AVAILABLE flag"""
-        from grilly.backend.base import VULKAN_AVAILABLE
+        from grilly.backend import VULKAN_AVAILABLE
 
         assert isinstance(VULKAN_AVAILABLE, bool)
 

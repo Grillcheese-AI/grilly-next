@@ -201,17 +201,22 @@ def run_phase2(data_dir, dim=10240, queue_depth=2048, max_docs=None,
 
         # -- B. Coherence Check (WorldModel GPU) ---------------------------
         #
-        # check_coherence_vec does two GPU Hamming lookups (~58us total):
-        #   support   = similarity to nearest known fact
-        #   violation = similarity to nearest constraint
-        #   score     = support - violation (range [-1, +1])
+        # The WorldModel compares (S, V, C) triples against known facts.
+        # SVC triples flow through from C++ JsonlReader → TrainingPayload.
+        # When a payload has SVC data, we encode it as a fact vector and
+        # check Hamming distance against both known_facts and constraints.
+        #
+        # Score = support - violation  (range [-1, +1])
+        #   > 0.3:  coherent with known facts → boost learning
+        #   < 0.0:  contradicts known facts   → block gradient
         #
         t_c = time.perf_counter()
-        if world_model is not None and world_model.fact_count > 0:
-            coh_result = world_model.check_coherence_vec(dev, vsa_data)
+        if world_model is not None and world_model.fact_count > 0 and payload.has_svc:
+            coh_result = world_model.check_coherence(
+                dev, payload.svc_subject, payload.svc_verb, payload.svc_complement)
             coherence = coh_result.score
         else:
-            coherence = 1.0  # No world model -> assume coherent
+            coherence = 1.0  # No SVC data or no WorldModel → pass through
         coherence_ms = (time.perf_counter() - t_c) * 1000
         coherence_times.append(coherence_ms)
 
@@ -287,6 +292,7 @@ def run_phase2(data_dir, dim=10240, queue_depth=2048, max_docs=None,
     # -- 5. Summary --------------------------------------------------------
     t_end = time.perf_counter()
     total_elapsed = t_end - t_start
+    pipeline.stop()   # Signal producer to stop (don't wait for all 491K if max_docs hit)
     pipeline.join()
     final = pipeline.stats()
 

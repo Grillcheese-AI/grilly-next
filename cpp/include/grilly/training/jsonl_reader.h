@@ -69,6 +69,20 @@ public:
                     doc.positions.push_back(i);
                 }
 
+                // Extract SVC triple: {"svc": {"s": "...", "v": "...", "c": "..."}}
+                doc.svc_subject.clear();
+                doc.svc_verb.clear();
+                doc.svc_complement.clear();
+                if (j.contains("svc") && j["svc"].is_object()) {
+                    const auto& svc = j["svc"];
+                    if (svc.contains("s") && svc["s"].is_string())
+                        doc.svc_subject = svc["s"].get<std::string>();
+                    if (svc.contains("v") && svc["v"].is_string())
+                        doc.svc_verb = svc["v"].get<std::string>();
+                    if (svc.contains("c") && svc["c"].is_string())
+                        doc.svc_complement = svc["c"].get<std::string>();
+                }
+
                 // Clear LLM token IDs (Phase 2 will populate these)
                 doc.llm_token_ids.clear();
 

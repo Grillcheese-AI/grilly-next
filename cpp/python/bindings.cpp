@@ -34,6 +34,9 @@
 #include "grilly/cubemind/resonator.h"
 #include "grilly/training/pipeline.h"
 #include "grilly/cognitive/world_model.h"
+#include "grilly/temporal/temporal_encoder.h"
+#include "grilly/temporal/counterfactual.h"
+#include "grilly/temporal/vulkan_temporal.h"
 #include "grilly/autograd/autograd.h"
 
 namespace py = pybind11;
@@ -1900,6 +1903,17 @@ PYBIND11_MODULE(grilly_core, m) {
         .def_property_readonly("stress",
              [](const grilly::TrainingPayload& p) {
                  return p.emotion.stress;
+             })
+        .def_readonly("svc_subject",
+             &grilly::TrainingPayload::svc_subject)
+        .def_readonly("svc_verb",
+             &grilly::TrainingPayload::svc_verb)
+        .def_readonly("svc_complement",
+             &grilly::TrainingPayload::svc_complement)
+        .def_property_readonly("has_svc",
+             [](const grilly::TrainingPayload& p) {
+                 return !p.svc_subject.empty() && !p.svc_verb.empty()
+                        && !p.svc_complement.empty();
              });
 
     py::class_<grilly::training::TrainingPipeline>(m, "TrainingPipeline")
@@ -2101,6 +2115,7 @@ PYBIND11_MODULE(grilly_core, m) {
         .value("CrossEntropy", grilly::autograd::OpType::CrossEntropy)
         .value("MSELoss", grilly::autograd::OpType::MSELoss)
         .value("CubeMindSurprise", grilly::autograd::OpType::CubeMindSurprise)
+        .value("TemporalSurprise", grilly::autograd::OpType::TemporalSurprise)
         .export_values();
 
     py::class_<grilly::autograd::TensorRef>(m, "TensorRef")
@@ -2172,6 +2187,49 @@ PYBIND11_MODULE(grilly_core, m) {
         .def("get_grad_buffer",
              &grilly::autograd::TapeContext::get_grad_buffer,
              py::arg("input_buffer_id"))
+        .def("record_temporal_surprise",
+             [](grilly::autograd::TapeContext& tape,
+                const grilly::autograd::TensorRef& input,
+                const grilly::autograd::TensorRef& output,
+                float avg_coherence,
+                float avg_contradiction,
+                uint32_t num_branches,
+                uint32_t dt,
+                float alpha) -> grilly::autograd::Node* {
+                 // Record the TemporalSurprise node on the tape
+                 grilly::autograd::TensorRef ins[1] = {input};
+                 grilly::autograd::TensorRef outs[1] = {output};
+
+                 // Pre-compute the temporal multiplier:
+                 //   1.0 = futures are fully coherent (pass gradient through)
+                 //   0.0 = half-contradictory (attenuate gradient)
+                 //  -1.0 = fully contradictory (reverse gradient direction)
+                 float multiplier = 1.0f - 2.0f * avg_contradiction;
+
+                 grilly::autograd::TemporalSurpriseParams tparams;
+                 tparams.avg_coherence = avg_coherence;
+                 tparams.avg_contradiction = avg_contradiction;
+                 tparams.temporal_multiplier = multiplier;
+                 tparams.alpha = alpha;
+                 tparams.num_branches = num_branches;
+                 tparams.dt = dt;
+
+                 auto* node = tape.record_op(
+                     grilly::autograd::OpType::TemporalSurprise,
+                     ins, 1, outs, 1,
+                     &tparams, sizeof(tparams));
+                 return node;
+             },
+             py::arg("input"),
+             py::arg("output"),
+             py::arg("avg_coherence"),
+             py::arg("avg_contradiction"),
+             py::arg("num_branches") = 128,
+             py::arg("dt") = 1,
+             py::arg("alpha") = 1.0f,
+             py::return_value_policy::reference,
+             "Record a TemporalSurprise node on the tape.\n"
+             "Stores counterfactual results for gradient modulation during backward.")
         .def("end", &grilly::autograd::TapeContext::end)
         .def("is_recording", &grilly::autograd::TapeContext::is_recording)
         .def("arena_bytes_used", &grilly::autograd::TapeContext::arena_bytes_used)
@@ -2218,4 +2276,232 @@ PYBIND11_MODULE(grilly_core, m) {
                  return node.outputs[idx];
              },
              py::arg("index"));
+
+    // ── Temporal: TemporalEncoder + CounterfactualReasoner ────────────────
+
+    py::class_<grilly::temporal::CounterfactualResult>(m, "CounterfactualResult")
+        .def_readonly("coherence", &grilly::temporal::CounterfactualResult::coherence)
+        .def_readonly("surprise", &grilly::temporal::CounterfactualResult::surprise)
+        .def_readonly("best_idx", &grilly::temporal::CounterfactualResult::best_idx);
+
+    // TemporalEncoder: static methods exposed as module-level functions
+    m.def("temporal_bind",
+         [](py::array_t<uint32_t> state, uint32_t t,
+            uint32_t dim) -> py::array_t<uint32_t> {
+             auto buf = state.request();
+             grilly::cubemind::BitpackedVec vec;
+             vec.dim = dim;
+             uint32_t words = (dim + 31) / 32;
+             vec.data.assign(
+                 static_cast<uint32_t*>(buf.ptr),
+                 static_cast<uint32_t*>(buf.ptr) + words);
+
+             auto result = grilly::temporal::TemporalEncoder::bind_time(vec, t);
+
+             py::array_t<uint32_t> arr(result.data.size());
+             std::memcpy(arr.mutable_data(), result.data.data(),
+                         result.data.size() * sizeof(uint32_t));
+             return arr;
+         },
+         py::arg("state"), py::arg("t"), py::arg("dim") = 10240,
+         "Bind a bitpacked VSA state to time step t (circular right shift)");
+
+    m.def("temporal_unbind",
+         [](py::array_t<uint32_t> state, uint32_t t,
+            uint32_t dim) -> py::array_t<uint32_t> {
+             auto buf = state.request();
+             grilly::cubemind::BitpackedVec vec;
+             vec.dim = dim;
+             uint32_t words = (dim + 31) / 32;
+             vec.data.assign(
+                 static_cast<uint32_t*>(buf.ptr),
+                 static_cast<uint32_t*>(buf.ptr) + words);
+
+             auto result = grilly::temporal::TemporalEncoder::unbind_time(vec, t);
+
+             py::array_t<uint32_t> arr(result.data.size());
+             std::memcpy(arr.mutable_data(), result.data.data(),
+                         result.data.size() * sizeof(uint32_t));
+             return arr;
+         },
+         py::arg("state"), py::arg("t"), py::arg("dim") = 10240,
+         "Unbind time step t from a previously bound state (circular left shift)");
+
+    m.def("xor_bind",
+         [](py::array_t<uint32_t> a, py::array_t<uint32_t> b,
+            uint32_t dim) -> py::array_t<uint32_t> {
+             auto buf_a = a.request();
+             auto buf_b = b.request();
+             uint32_t words = (dim + 31) / 32;
+
+             grilly::cubemind::BitpackedVec va, vb;
+             va.dim = dim; vb.dim = dim;
+             va.data.assign(
+                 static_cast<uint32_t*>(buf_a.ptr),
+                 static_cast<uint32_t*>(buf_a.ptr) + words);
+             vb.data.assign(
+                 static_cast<uint32_t*>(buf_b.ptr),
+                 static_cast<uint32_t*>(buf_b.ptr) + words);
+
+             auto result = grilly::temporal::TemporalEncoder::xor_bind(va, vb);
+
+             py::array_t<uint32_t> arr(result.data.size());
+             std::memcpy(arr.mutable_data(), result.data.data(),
+                         result.data.size() * sizeof(uint32_t));
+             return arr;
+         },
+         py::arg("a"), py::arg("b"), py::arg("dim") = 10240,
+         "XOR-bind two bitpacked VSA vectors (self-inverse binding)");
+
+    py::class_<grilly::temporal::CounterfactualReasoner>(m, "CounterfactualReasoner")
+        .def(py::init<>())
+        .def("evaluate",
+             [](grilly::temporal::CounterfactualReasoner& cf,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> timeline,
+                py::array_t<uint32_t> actual_fact,
+                py::array_t<uint32_t> what_if_fact,
+                grilly::cubemind::VSACache& world_cache,
+                uint32_t dt, uint32_t dim) {
+                 auto buf_t = timeline.request();
+                 auto buf_a = actual_fact.request();
+                 auto buf_w = what_if_fact.request();
+                 uint32_t words = (dim + 31) / 32;
+
+                 grilly::cubemind::BitpackedVec vt, va, vw;
+                 vt.dim = dim; va.dim = dim; vw.dim = dim;
+                 vt.data.assign(
+                     static_cast<uint32_t*>(buf_t.ptr),
+                     static_cast<uint32_t*>(buf_t.ptr) + words);
+                 va.data.assign(
+                     static_cast<uint32_t*>(buf_a.ptr),
+                     static_cast<uint32_t*>(buf_a.ptr) + words);
+                 vw.data.assign(
+                     static_cast<uint32_t*>(buf_w.ptr),
+                     static_cast<uint32_t*>(buf_w.ptr) + words);
+
+                 return cf.evaluate(vt, va, vw, world_cache,
+                                    ctx.batch, ctx.cache, dt);
+             },
+             py::arg("device"),
+             py::arg("timeline"),
+             py::arg("actual_fact"),
+             py::arg("what_if_fact"),
+             py::arg("world_cache"),
+             py::arg("dt") = 1,
+             py::arg("dim") = 10240,
+             "Evaluate a counterfactual: erase actual_fact, insert what_if_fact, "
+             "project dt steps forward, and check coherence against world_cache")
+        .def("evaluate_cpu",
+             [](grilly::temporal::CounterfactualReasoner& cf,
+                py::array_t<uint32_t> timeline,
+                py::array_t<uint32_t> actual_fact,
+                py::array_t<uint32_t> what_if_fact,
+                grilly::cubemind::VSACache& world_cache,
+                uint32_t dt, uint32_t dim) {
+                 auto buf_t = timeline.request();
+                 auto buf_a = actual_fact.request();
+                 auto buf_w = what_if_fact.request();
+                 uint32_t words = (dim + 31) / 32;
+
+                 grilly::cubemind::BitpackedVec vt, va, vw;
+                 vt.dim = dim; va.dim = dim; vw.dim = dim;
+                 vt.data.assign(
+                     static_cast<uint32_t*>(buf_t.ptr),
+                     static_cast<uint32_t*>(buf_t.ptr) + words);
+                 va.data.assign(
+                     static_cast<uint32_t*>(buf_a.ptr),
+                     static_cast<uint32_t*>(buf_a.ptr) + words);
+                 vw.data.assign(
+                     static_cast<uint32_t*>(buf_w.ptr),
+                     static_cast<uint32_t*>(buf_w.ptr) + words);
+
+                 return cf.evaluate_cpu(vt, va, vw, world_cache, dt);
+             },
+             py::arg("timeline"),
+             py::arg("actual_fact"),
+             py::arg("what_if_fact"),
+             py::arg("world_cache"),
+             py::arg("dt") = 1,
+             py::arg("dim") = 10240,
+             "CPU-only counterfactual evaluation (no GPU needed)");
+
+    // ── Temporal: VulkanTemporalDispatcher (GPU Batch Operations) ─────────
+
+    m.def("batch_temporal_shift",
+         [](GrillyCoreContext& ctx,
+            py::array_t<uint32_t, py::array::c_style | py::array::forcecast> input,
+            uint32_t shift_amount,
+            uint32_t mode,
+            uint32_t dim) -> py::array_t<uint32_t> {
+             auto buf = input.request();
+             if (buf.ndim != 2) {
+                 throw std::runtime_error(
+                     "input must be 2D array of shape (batch_size, words_per_vec)");
+             }
+
+             uint32_t batch_size = static_cast<uint32_t>(buf.shape[0]);
+             uint32_t words_per_vec = (dim + 31) / 32;
+
+             auto result = grilly::temporal::VulkanTemporalDispatcher::dispatch(
+                 ctx.batch, ctx.pool, ctx.cache,
+                 static_cast<const uint32_t*>(buf.ptr),
+                 batch_size, words_per_vec, shift_amount, mode);
+
+             py::array_t<uint32_t> arr({batch_size, words_per_vec});
+             std::memcpy(arr.mutable_data(), result.data.data(),
+                         result.data.size() * sizeof(uint32_t));
+             return arr;
+         },
+         py::arg("device"),
+         py::arg("input"),
+         py::arg("shift_amount") = 1,
+         py::arg("mode") = 0,
+         py::arg("dim") = 10240,
+         "GPU batch circular shift: shift N bitpacked vectors simultaneously.\n"
+         "mode 0 = right shift (bind_time), mode 1 = left shift (unbind_time)");
+
+    m.def("batch_counterfactuals",
+         [](GrillyCoreContext& ctx,
+            py::array_t<uint32_t> base_timeline,
+            py::array_t<uint32_t, py::array::c_style | py::array::forcecast> actual_facts,
+            py::array_t<uint32_t, py::array::c_style | py::array::forcecast> what_if_facts,
+            uint32_t dt,
+            uint32_t dim) -> py::array_t<uint32_t> {
+             auto buf_base = base_timeline.request();
+             auto buf_actual = actual_facts.request();
+             auto buf_whatif = what_if_facts.request();
+
+             if (buf_actual.ndim != 2 || buf_whatif.ndim != 2) {
+                 throw std::runtime_error(
+                     "actual_facts and what_if_facts must be 2D (N, words_per_vec)");
+             }
+
+             uint32_t n = static_cast<uint32_t>(buf_actual.shape[0]);
+             uint32_t words_per_vec = (dim + 31) / 32;
+
+             auto result = grilly::temporal::VulkanTemporalDispatcher
+                 ::batch_counterfactuals(
+                     ctx.batch, ctx.pool, ctx.cache,
+                     static_cast<const uint32_t*>(buf_base.ptr),
+                     static_cast<const uint32_t*>(buf_actual.ptr),
+                     static_cast<const uint32_t*>(buf_whatif.ptr),
+                     n, words_per_vec, dt);
+
+             py::array_t<uint32_t> arr({n, words_per_vec});
+             std::memcpy(arr.mutable_data(), result.data.data(),
+                         result.data.size() * sizeof(uint32_t));
+             return arr;
+         },
+         py::arg("device"),
+         py::arg("base_timeline"),
+         py::arg("actual_facts"),
+         py::arg("what_if_facts"),
+         py::arg("dt") = 1,
+         py::arg("dim") = 10240,
+         "GPU batch counterfactual evaluation:\n"
+         "  1. XOR-erase actual_facts from base_timeline (CPU, instant)\n"
+         "  2. XOR-insert what_if_facts (CPU, instant)\n"
+         "  3. Circular shift all N timelines forward by dt steps (GPU)\n"
+         "Returns (N, words_per_vec) array of shifted alternate futures.");
 }
