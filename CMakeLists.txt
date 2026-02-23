@@ -147,6 +147,7 @@ add_library(grilly_core_lib STATIC
     cpp/src/cubemind/semantic_assigner.cpp
     cpp/src/cubemind/resonator.cpp
     cpp/src/training/pipeline.cpp
+    cpp/src/cognitive/world_model.cpp
     cpp/src/autograd.cpp
 )
 

@@ -33,6 +33,7 @@
 #include "grilly/cubemind/semantic_assigner.h"
 #include "grilly/cubemind/resonator.h"
 #include "grilly/training/pipeline.h"
+#include "grilly/cognitive/world_model.h"
 #include "grilly/autograd/autograd.h"
 
 namespace py = pybind11;
@@ -1575,6 +1576,51 @@ PYBIND11_MODULE(grilly_core, m) {
                  return d;
              },
              py::arg("device"), py::arg("query"), py::arg("top_k") = 5)
+        .def("lookup_packed",
+             [](grilly::cubemind::VSACache& cache,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> query_packed,
+                uint32_t topK) -> py::dict {
+                 auto buf = query_packed.request();
+                 uint32_t words = static_cast<uint32_t>(buf.shape[0]);
+
+                 grilly::cubemind::BitpackedVec packed;
+                 packed.dim = words * 32;
+                 packed.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + words);
+
+                 auto result = cache.lookup(ctx.batch, ctx.cache, packed, topK);
+
+                 py::dict d;
+                 d["indices"] = py::array_t<uint32_t>(
+                     result.indices.size(), result.indices.data());
+                 d["distances"] = py::array_t<uint32_t>(
+                     result.distances.size(), result.distances.data());
+                 d["surprise"] = result.querySurprise;
+                 return d;
+             },
+             py::arg("device"), py::arg("query_packed"), py::arg("top_k") = 5,
+             "Lookup using pre-bitpacked uint32 query (avoids unpack/repack)")
+        .def("insert_packed",
+             [](grilly::cubemind::VSACache& cache,
+                py::array_t<uint32_t> key_packed,
+                float surprise, float stress) -> bool {
+                 auto buf = key_packed.request();
+                 uint32_t words = static_cast<uint32_t>(buf.shape[0]);
+
+                 grilly::cubemind::BitpackedVec packed;
+                 packed.dim = words * 32;
+                 packed.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + words);
+
+                 grilly::cubemind::EmotionState emo{surprise, stress};
+                 return cache.insert(packed, emo);
+             },
+             py::arg("key_packed"),
+             py::arg("surprise") = 1.0f, py::arg("stress") = 0.0f,
+             "Insert using pre-bitpacked uint32 key (avoids bitpack overhead)")
         .def("insert",
              [](grilly::cubemind::VSACache& cache,
                 py::array_t<int8_t> key,
@@ -1916,6 +1962,112 @@ PYBIND11_MODULE(grilly_core, m) {
                  d["producer_busy_pct"] = s.producer_busy_pct;
                  return d;
              });
+
+    // ── Cognitive: WorldModel (Dual VSACache Fact Engine) ────────────────
+
+    py::class_<grilly::cognitive::CoherenceResult>(m, "CoherenceResult")
+        .def_readonly("support", &grilly::cognitive::CoherenceResult::support)
+        .def_readonly("violation", &grilly::cognitive::CoherenceResult::violation)
+        .def_readonly("score", &grilly::cognitive::CoherenceResult::score)
+        .def_readonly("coherent", &grilly::cognitive::CoherenceResult::coherent)
+        .def_readonly("nearest_fact_idx",
+                      &grilly::cognitive::CoherenceResult::nearestFactIdx)
+        .def_readonly("nearest_constraint_idx",
+                      &grilly::cognitive::CoherenceResult::nearestConstraintIdx);
+
+    py::class_<grilly::cognitive::WorldModel>(m, "WorldModel")
+        .def(py::init([](GrillyCoreContext& ctx,
+                         uint32_t dim,
+                         uint32_t fact_capacity,
+                         uint32_t constraint_capacity,
+                         float coherence_threshold,
+                         float surprise_threshold) {
+                 grilly::cognitive::WorldModelConfig cfg;
+                 cfg.dim = dim;
+                 cfg.factCapacity = fact_capacity;
+                 cfg.constraintCapacity = constraint_capacity;
+                 cfg.coherenceThreshold = coherence_threshold;
+                 cfg.surpriseThreshold = surprise_threshold;
+                 return std::make_unique<grilly::cognitive::WorldModel>(
+                     ctx.pool, cfg);
+             }),
+             py::arg("device"),
+             py::arg("dim") = 10240,
+             py::arg("fact_capacity") = 500000,
+             py::arg("constraint_capacity") = 500000,
+             py::arg("coherence_threshold") = 0.3f,
+             py::arg("surprise_threshold") = 0.3f,
+             py::keep_alive<1, 2>())
+        .def("add_fact",
+             &grilly::cognitive::WorldModel::add_fact,
+             py::arg("subject"), py::arg("relation"), py::arg("object"),
+             "Add a (S, R, O) fact and auto-generate negation constraint")
+        .def("check_coherence",
+             [](grilly::cognitive::WorldModel& wm,
+                GrillyCoreContext& ctx,
+                const std::string& subject,
+                const std::string& relation,
+                const std::string& object) {
+                 return wm.check_coherence(ctx.batch, ctx.cache,
+                                           subject, relation, object);
+             },
+             py::arg("device"),
+             py::arg("subject"), py::arg("relation"), py::arg("object"),
+             "Check coherence of a (S, R, O) triple via GPU Hamming search")
+        .def("check_coherence_vec",
+             [](grilly::cognitive::WorldModel& wm,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> statement) {
+                 auto buf = statement.request();
+                 uint32_t dim = wm.dim();
+                 uint32_t words = (dim + 31) / 32;
+
+                 grilly::cubemind::BitpackedVec vec;
+                 vec.dim = dim;
+                 vec.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + words);
+
+                 return wm.check_coherence(ctx.batch, ctx.cache, vec);
+             },
+             py::arg("device"), py::arg("statement"),
+             "Check coherence of a pre-encoded bitpacked vector")
+        .def("check_coherence_cpu",
+             [](grilly::cognitive::WorldModel& wm,
+                py::array_t<uint32_t> statement) {
+                 auto buf = statement.request();
+                 uint32_t dim = wm.dim();
+                 uint32_t words = (dim + 31) / 32;
+
+                 grilly::cubemind::BitpackedVec vec;
+                 vec.dim = dim;
+                 vec.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + words);
+
+                 return wm.check_coherence_cpu(vec);
+             },
+             py::arg("statement"),
+             "Check coherence via CPU (no GPU needed, for testing)")
+        .def("encode_triple",
+             [](const grilly::cognitive::WorldModel& wm,
+                const std::string& subject,
+                const std::string& relation,
+                const std::string& object) -> py::array_t<uint32_t> {
+                 auto vec = wm.encode_triple(subject, relation, object);
+                 py::array_t<uint32_t> arr(vec.data.size());
+                 std::memcpy(arr.mutable_data(), vec.data.data(),
+                             vec.data.size() * sizeof(uint32_t));
+                 return arr;
+             },
+             py::arg("subject"), py::arg("relation"), py::arg("object"),
+             "Encode a (S, R, O) triple into a bitpacked vector")
+        .def_property_readonly("fact_count",
+             &grilly::cognitive::WorldModel::fact_count)
+        .def_property_readonly("constraint_count",
+             &grilly::cognitive::WorldModel::constraint_count)
+        .def_property_readonly("dim",
+             &grilly::cognitive::WorldModel::dim);
 
     // ── Autograd: TapeArena + Wengert List Backward Engine ──────────────
 
