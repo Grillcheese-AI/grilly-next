@@ -216,3 +216,67 @@ OpGraph = _core.OpGraph if NATIVE_AVAILABLE else None
 # ── KVCache class ────────────────────────────────────────────────────────
 
 KVCache = _core.KVCache if NATIVE_AVAILABLE else None
+
+
+# ── Autograd: TapeArena + Wengert List Backward Engine ──────────────────
+
+# OpType enum — maps to backward shader dispatch in C++
+OpType = _core.OpType if NATIVE_AVAILABLE else None
+
+# TensorRef — lightweight tensor descriptor for the autograd graph
+TensorRef = _core.TensorRef if NATIVE_AVAILABLE else None
+
+# TapeContext — records forward pass, runs backward via Wengert list walk
+TapeContext = _core.TapeContext if NATIVE_AVAILABLE else None
+
+# AutogradNode — read-only inspection of arena-allocated nodes
+AutogradNode = _core.AutogradNode if NATIVE_AVAILABLE else None
+
+AUTOGRAD_AVAILABLE = NATIVE_AVAILABLE and TapeContext is not None
+
+
+def create_tape_context(device, arena_capacity=64 * 1024 * 1024):
+    """Create a TapeContext for recording autograd graphs on the C++ arena.
+
+    Parameters
+    ----------
+    device : grilly_core.Device
+        The Vulkan device context.
+    arena_capacity : int
+        Arena size in bytes (default 64 MB).
+
+    Returns
+    -------
+    grilly_core.TapeContext
+    """
+    if not AUTOGRAD_AVAILABLE:
+        raise RuntimeError("C++ autograd not available — grilly_core missing or outdated")
+    return _core.TapeContext(device, arena_capacity)
+
+
+def make_tensor_ref(buffer_id, shape, dtype=0, requires_grad=True):
+    """Create a TensorRef descriptor for the autograd graph.
+
+    Parameters
+    ----------
+    buffer_id : int
+        BufferPool buffer ID.
+    shape : list[int]
+        Tensor dimensions (max 8).
+    dtype : int
+        0=f32, 1=f16, 2=u32, 3=i32
+    requires_grad : bool
+        Whether this tensor needs gradients.
+
+    Returns
+    -------
+    grilly_core.TensorRef
+    """
+    if not AUTOGRAD_AVAILABLE:
+        raise RuntimeError("C++ autograd not available")
+    ref = _core.TensorRef()
+    ref.buffer_id = buffer_id
+    ref.set_shape(shape)
+    ref.dtype = dtype
+    ref.requires_grad = requires_grad
+    return ref

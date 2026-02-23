@@ -29,6 +29,8 @@
 #include "grilly/cubemind/vsa.h"
 #include "grilly/cubemind/cube.h"
 #include "grilly/cubemind/cache.h"
+#include "grilly/cubemind/text_encoder.h"
+#include "grilly/autograd/autograd.h"
 
 namespace py = pybind11;
 
@@ -1599,4 +1601,202 @@ PYBIND11_MODULE(grilly_core, m) {
                  d["last_lookup_ms"] = s.lastLookupMs;
                  return d;
              });
+
+    // ── CubeMind: TextEncoder (FastText LSH → Bipolar VSA) ────────────
+
+    py::class_<grilly::cubemind::TextEncoder>(m, "TextEncoder")
+        .def(py::init<uint32_t, uint32_t>(),
+             py::arg("dim") = 10240, py::arg("ft_dim") = 300)
+        .def("encode_sentence",
+             [](grilly::cubemind::TextEncoder& enc,
+                const std::vector<std::string>& tokens,
+                const std::vector<std::string>& roles,
+                const std::vector<uint32_t>& positions) -> py::dict {
+                 auto packed = enc.encode_sentence(tokens, roles, positions);
+                 py::dict d;
+                 d["data"] = py::array_t<uint32_t>(
+                     packed.data.size(), packed.data.data());
+                 d["dim"] = packed.dim;
+                 d["num_words"] = packed.numWords();
+                 return d;
+             },
+             py::arg("tokens"), py::arg("dependency_roles"),
+             py::arg("positions"))
+        .def("load_fillers", &grilly::cubemind::TextEncoder::load_fillers,
+             py::arg("path"))
+        .def("project_to_bipolar",
+             [](const grilly::cubemind::TextEncoder& enc,
+                py::array_t<float> ft_vec) -> py::array_t<int8_t> {
+                 auto buf = ft_vec.request();
+                 auto result = enc.project_to_bipolar(
+                     static_cast<const float*>(buf.ptr));
+                 return py::array_t<int8_t>(result.size(), result.data());
+             },
+             py::arg("ft_vec"))
+        .def("add_filler",
+             [](grilly::cubemind::TextEncoder& enc,
+                const std::string& token,
+                py::array_t<int8_t> bipolar) {
+                 auto buf = bipolar.request();
+                 std::vector<int8_t> vec(
+                     static_cast<int8_t*>(buf.ptr),
+                     static_cast<int8_t*>(buf.ptr) + buf.size);
+                 enc.add_filler(token, vec);
+             },
+             py::arg("token"), py::arg("bipolar"))
+        .def("has_filler", &grilly::cubemind::TextEncoder::has_filler,
+             py::arg("token"))
+        .def("vocab_size", &grilly::cubemind::TextEncoder::vocab_size)
+        .def_property_readonly("dim", &grilly::cubemind::TextEncoder::dim)
+        .def_property_readonly("ft_dim", &grilly::cubemind::TextEncoder::ft_dim);
+
+    // ── Autograd: TapeArena + Wengert List Backward Engine ──────────────
+
+    py::enum_<grilly::autograd::OpType>(m, "OpType")
+        .value("Add", grilly::autograd::OpType::Add)
+        .value("Sub", grilly::autograd::OpType::Sub)
+        .value("Mul", grilly::autograd::OpType::Mul)
+        .value("Div", grilly::autograd::OpType::Div)
+        .value("Neg", grilly::autograd::OpType::Neg)
+        .value("Pow", grilly::autograd::OpType::Pow)
+        .value("MatMul", grilly::autograd::OpType::MatMul)
+        .value("Linear", grilly::autograd::OpType::Linear)
+        .value("ReLU", grilly::autograd::OpType::ReLU)
+        .value("GELU", grilly::autograd::OpType::GELU)
+        .value("SiLU", grilly::autograd::OpType::SiLU)
+        .value("Tanh", grilly::autograd::OpType::Tanh)
+        .value("Sigmoid", grilly::autograd::OpType::Sigmoid)
+        .value("Softmax", grilly::autograd::OpType::Softmax)
+        .value("LayerNorm", grilly::autograd::OpType::LayerNorm)
+        .value("RMSNorm", grilly::autograd::OpType::RMSNorm)
+        .value("FlashAttention2", grilly::autograd::OpType::FlashAttention2)
+        .value("Conv2d", grilly::autograd::OpType::Conv2d)
+        .value("Conv1d", grilly::autograd::OpType::Conv1d)
+        .value("Sum", grilly::autograd::OpType::Sum)
+        .value("Mean", grilly::autograd::OpType::Mean)
+        .value("Max", grilly::autograd::OpType::Max)
+        .value("Min", grilly::autograd::OpType::Min)
+        .value("Reshape", grilly::autograd::OpType::Reshape)
+        .value("Transpose", grilly::autograd::OpType::Transpose)
+        .value("Slice", grilly::autograd::OpType::Slice)
+        .value("CrossEntropy", grilly::autograd::OpType::CrossEntropy)
+        .value("MSELoss", grilly::autograd::OpType::MSELoss)
+        .value("CubeMindSurprise", grilly::autograd::OpType::CubeMindSurprise)
+        .export_values();
+
+    py::class_<grilly::autograd::TensorRef>(m, "TensorRef")
+        .def(py::init<>())
+        .def_readwrite("buffer_id", &grilly::autograd::TensorRef::buffer_id)
+        .def_readwrite("ndim", &grilly::autograd::TensorRef::ndim)
+        .def_readwrite("dtype", &grilly::autograd::TensorRef::dtype)
+        .def_readwrite("requires_grad", &grilly::autograd::TensorRef::requires_grad)
+        .def("numel", &grilly::autograd::TensorRef::numel)
+        .def("size_bytes", &grilly::autograd::TensorRef::size_bytes)
+        .def("valid", &grilly::autograd::TensorRef::valid)
+        .def_static("none", &grilly::autograd::TensorRef::none)
+        .def("set_shape",
+             [](grilly::autograd::TensorRef& ref,
+                const std::vector<uint32_t>& shape) {
+                 ref.ndim = static_cast<uint32_t>(
+                     std::min(shape.size(), size_t(8)));
+                 for (uint32_t i = 0; i < ref.ndim; ++i) {
+                     ref.shape[i] = shape[i];
+                 }
+             },
+             py::arg("shape"))
+        .def("get_shape",
+             [](const grilly::autograd::TensorRef& ref) -> std::vector<uint32_t> {
+                 return std::vector<uint32_t>(ref.shape, ref.shape + ref.ndim);
+             });
+
+    py::class_<grilly::autograd::TapeContext>(m, "TapeContext")
+        .def(py::init(
+                 [](GrillyCoreContext& ctx, size_t capacity) {
+                     return new grilly::autograd::TapeContext(
+                         ctx.pool, ctx.batch, ctx.cache, capacity);
+                 }),
+             py::arg("device"),
+             py::arg("arena_capacity") = grilly::autograd::TapeArena::kDefaultCapacity,
+             py::keep_alive<1, 2>())
+        .def("begin", &grilly::autograd::TapeContext::begin)
+        .def("record_op",
+             [](grilly::autograd::TapeContext& tape,
+                grilly::autograd::OpType op,
+                const std::vector<grilly::autograd::TensorRef>& inputs,
+                const std::vector<grilly::autograd::TensorRef>& outputs)
+                 -> grilly::autograd::Node* {
+                 return tape.record_op(
+                     op,
+                     inputs.data(),
+                     static_cast<uint32_t>(inputs.size()),
+                     outputs.data(),
+                     static_cast<uint32_t>(outputs.size()));
+             },
+             py::arg("op"), py::arg("inputs"), py::arg("outputs"),
+             py::return_value_policy::reference)
+        .def("save_for_backward",
+             [](grilly::autograd::TapeContext& tape,
+                grilly::autograd::Node* node,
+                const std::vector<uint32_t>& buffer_ids) {
+                 tape.save_for_backward(
+                     node, buffer_ids.data(),
+                     static_cast<uint32_t>(buffer_ids.size()));
+             },
+             py::arg("node"), py::arg("buffer_ids"))
+        .def("backward",
+             [](grilly::autograd::TapeContext& tape,
+                grilly::autograd::Node* loss_node,
+                uint32_t grad_output_buffer) {
+                 tape.backward(loss_node, grad_output_buffer);
+             },
+             py::arg("loss_node"), py::arg("grad_output_buffer"))
+        .def("get_grad_buffer",
+             &grilly::autograd::TapeContext::get_grad_buffer,
+             py::arg("input_buffer_id"))
+        .def("end", &grilly::autograd::TapeContext::end)
+        .def("is_recording", &grilly::autograd::TapeContext::is_recording)
+        .def("arena_bytes_used", &grilly::autograd::TapeContext::arena_bytes_used)
+        .def("arena_utilization", &grilly::autograd::TapeContext::arena_utilization)
+        .def("last_backward_stats",
+             [](const grilly::autograd::TapeContext& tape) -> py::dict {
+                 auto s = tape.last_backward_stats();
+                 py::dict d;
+                 d["nodes_visited"] = s.nodes_visited;
+                 d["nodes_with_grad"] = s.nodes_with_grad;
+                 d["shaders_dispatched"] = s.shaders_dispatched;
+                 d["cpu_fallbacks"] = s.cpu_fallbacks;
+                 return d;
+             });
+
+    // Expose Node for inspection (read-only from Python)
+    py::class_<grilly::autograd::Node>(m, "AutogradNode")
+        .def_readonly("op", &grilly::autograd::Node::op)
+        .def_readonly("seq", &grilly::autograd::Node::seq)
+        .def_readonly("num_inputs", &grilly::autograd::Node::num_inputs)
+        .def_readonly("num_outputs", &grilly::autograd::Node::num_outputs)
+        .def_readonly("num_saved", &grilly::autograd::Node::num_saved)
+        .def_readonly("grad_output_buffer",
+                      &grilly::autograd::Node::grad_output_buffer)
+        .def("get_grad_input_buffer",
+             [](const grilly::autograd::Node& node, uint32_t idx) -> uint32_t {
+                 if (idx >= grilly::autograd::kMaxNodeIO) return 0;
+                 return node.grad_input_buffers[idx];
+             },
+             py::arg("index"))
+        .def("get_input",
+             [](const grilly::autograd::Node& node, uint32_t idx)
+                 -> grilly::autograd::TensorRef {
+                 if (idx >= grilly::autograd::kMaxNodeIO)
+                     return grilly::autograd::TensorRef::none();
+                 return node.inputs[idx];
+             },
+             py::arg("index"))
+        .def("get_output",
+             [](const grilly::autograd::Node& node, uint32_t idx)
+                 -> grilly::autograd::TensorRef {
+                 if (idx >= grilly::autograd::kMaxNodeIO)
+                     return grilly::autograd::TensorRef::none();
+                 return node.outputs[idx];
+             },
+             py::arg("index"));
 }

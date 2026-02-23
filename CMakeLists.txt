@@ -143,6 +143,8 @@ add_library(grilly_core_lib STATIC
     cpp/src/cubemind/vsa.cpp
     cpp/src/cubemind/cube.cpp
     cpp/src/cubemind/cache.cpp
+    cpp/src/cubemind/text_encoder.cpp
+    cpp/src/autograd.cpp
 )
 
 target_include_directories(grilly_core_lib PUBLIC
