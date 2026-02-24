@@ -1,0 +1,41 @@
+{
+  "AMD_LOCAL": {
+    "device_name": "RX_6750_XT",
+    "subgroup_size": 64,
+    "arena_size_gb": 2,
+    "vsa_dim": 10240,
+    "max_cache_capacity": 500000,
+    "max_constraint_capacity": 500000,
+    "surprise_threshold": 0.15,
+    "coherence_threshold": 0.3,
+    "thinking_steps": 10,
+    "batch_size": 32,
+    "workgroup_size": 256
+  },
+  "A40_MASSIVE": {
+    "device_name": "NVIDIA_A40",
+    "subgroup_size": 32,
+    "arena_size_gb": 20,
+    "vsa_dim": 10240,
+    "max_cache_capacity": 4000000,
+    "max_constraint_capacity": 4000000,
+    "surprise_threshold": 0.12,
+    "coherence_threshold": 0.3,
+    "thinking_steps": 50,
+    "batch_size": 512,
+    "workgroup_size": 256
+  },
+  "A100_EXTREME": {
+    "device_name": "NVIDIA_A100",
+    "subgroup_size": 32,
+    "arena_size_gb": 40,
+    "vsa_dim": 10240,
+    "max_cache_capacity": 8000000,
+    "max_constraint_capacity": 8000000,
+    "surprise_threshold": 0.10,
+    "coherence_threshold": 0.3,
+    "thinking_steps": 100,
+    "batch_size": 1024,
+    "workgroup_size": 256
+  }
+}

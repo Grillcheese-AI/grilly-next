@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+dist/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitmodules
+
+# Large data files
+*.bin
+*.bin.gz
+*.safetensors
+*.gguf
+data/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Compiled shaders (will recompile)
+shaders/spv/
+
+# Archives (design docs, not runtime)
+archive/

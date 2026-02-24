@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CubeMind Reasoning Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ── Header ────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .header .meta {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .header .meta span { margin-left: 16px; }
+  .status-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .status-dot.live { background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* ── Layout ────────────────────────────────────── */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 16px 24px;
+  }
+  .full-width { grid-column: 1 / -1; }
+
+  /* ── Cards ─────────────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+
+  /* ── Big Numbers ───────────────────────────────── */
+  .metrics-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+  }
+  .metric {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+  }
+  .metric .label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .metric .value {
+    font-size: 28px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .metric .sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+  .color-surprise { color: var(--accent); }
+  .color-stress { color: var(--red); }
+  .color-green { color: var(--green); }
+  .color-orange { color: var(--orange); }
+
+  /* ── Charts ────────────────────────────────────── */
+  .chart-container {
+    position: relative;
+    width: 100%;
+    height: 200px;
+  }
+  .chart-container canvas {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* ── Stats Table ───────────────────────────────── */
+  .stats-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .stats-table td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .stats-table td:first-child {
+    color: var(--text-dim);
+    width: 50%;
+  }
+  .stats-table td:last-child {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Responsive ────────────────────────────────── */
+  @media (max-width: 800px) {
+    .grid { grid-template-columns: 1fr; }
+    .metrics-row { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span class="status-dot" id="statusDot"></span>CubeMind Reasoning Monitor</h1>
+  <div class="meta">
+    <span id="deviceName">—</span>
+    <span id="profileName"></span>
+    <span>Step <strong id="stepCount">0</strong></span>
+    <span id="uptime">0:00:00</span>
+  </div>
+</div>
+
+<!-- Big numbers -->
+<div style="padding: 16px 24px 0;">
+  <div class="metrics-row">
+    <div class="metric">
+      <div class="label">Surprise</div>
+      <div class="value color-surprise" id="valSurprise">0.000</div>
+      <div class="sub">novelty / learning rate</div>
+    </div>
+    <div class="metric">
+      <div class="label">Stress</div>
+      <div class="value color-stress" id="valStress">0.000</div>
+      <div class="sub">geometric distortion</div>
+    </div>
+    <div class="metric">
+      <div class="label">LR Multiplier</div>
+      <div class="value color-orange" id="valLR">1.00x</div>
+      <div class="sub">1 + surprise</div>
+    </div>
+    <div class="metric">
+      <div class="label">Cache Fill</div>
+      <div class="value color-green" id="valCacheFill">—</div>
+      <div class="sub" id="valCacheDetail">size / capacity</div>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Surprise Chart -->
+  <div class="card">
+    <h2>Surprise Over Time</h2>
+    <div class="chart-container">
+      <canvas id="chartSurprise"></canvas>
+    </div>
+  </div>
+
+  <!-- Stress Chart -->
+  <div class="card">
+    <h2>Stress Over Time</h2>
+    <div class="chart-container">
+      <canvas id="chartStress"></canvas>
+    </div>
+  </div>
+
+  <!-- Cache Stats -->
+  <div class="card">
+    <h2>VSA Cache</h2>
+    <table class="stats-table" id="cacheTable">
+      <tr><td>Size</td><td id="csSize">—</td></tr>
+      <tr><td>Capacity</td><td id="csCapacity">—</td></tr>
+      <tr><td>Total Inserts</td><td id="csInserts">—</td></tr>
+      <tr><td>Total Evictions</td><td id="csEvictions">—</td></tr>
+      <tr><td>Total Lookups</td><td id="csLookups">—</td></tr>
+      <tr><td>Avg Surprise</td><td id="csAvgSurprise">—</td></tr>
+      <tr><td>Avg Utility</td><td id="csAvgUtility">—</td></tr>
+      <tr><td>Last Lookup</td><td id="csLookupMs">—</td></tr>
+    </table>
+  </div>
+
+  <!-- Training Stats -->
+  <div class="card">
+    <h2>Training Pipeline</h2>
+    <table class="stats-table" id="trainingTable">
+      <tr><td>Docs Encoded</td><td id="tsDocs">—</td></tr>
+      <tr><td>Payloads Consumed</td><td id="tsPayloads">—</td></tr>
+      <tr><td>Queue Size</td><td id="tsQueue">—</td></tr>
+      <tr><td>Encoding Rate</td><td id="tsRate">—</td></tr>
+      <tr><td>Elapsed</td><td id="tsElapsed">—</td></tr>
+      <tr><td>Producer Busy</td><td id="tsBusy">—</td></tr>
+    </table>
+  </div>
+</div>
+
+<script>
+// ── Chart Renderer ──────────────────────────────────────────────────────
+
+class LineChart {
+  constructor(canvasId, color, label) {
+    this.canvas = document.getElementById(canvasId);
+    this.ctx = this.canvas.getContext('2d');
+    this.color = color;
+    this.label = label;
+    this.data = [];
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+  }
+
+  resize() {
+    const rect = this.canvas.parentElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = rect.width * dpr;
+    this.canvas.height = rect.height * dpr;
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.w = rect.width;
+    this.h = rect.height;
+    this.draw();
+  }
+
+  update(data) {
+    this.data = data;
+    this.draw();
+  }
+
+  draw() {
+    const { ctx, w, h, data, color } = this;
+    const pad = { top: 8, right: 12, bottom: 24, left: 48 };
+    const plotW = w - pad.left - pad.right;
+    const plotH = h - pad.top - pad.bottom;
+
+    ctx.clearRect(0, 0, w, h);
+
+    if (data.length < 2) {
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Waiting for data...', w / 2, h / 2);
+      return;
+    }
+
+    // Auto-scale Y axis
+    let yMin = Math.min(...data);
+    let yMax = Math.max(...data);
+    if (yMax - yMin < 0.01) { yMin -= 0.05; yMax += 0.05; }
+    const yPad = (yMax - yMin) * 0.1;
+    yMin -= yPad;
+    yMax += yPad;
+    if (yMin < 0) yMin = 0;
+    if (yMax > 1) yMax = 1;
+    if (yMax <= yMin) yMax = yMin + 0.1;
+
+    const xScale = plotW / (data.length - 1);
+    const yScale = plotH / (yMax - yMin);
+
+    // Grid lines
+    ctx.strokeStyle = '#21262d';
+    ctx.lineWidth = 1;
+    const nGridY = 4;
+    for (let i = 0; i <= nGridY; i++) {
+      const y = pad.top + (plotH / nGridY) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+
+      const val = yMax - (i / nGridY) * (yMax - yMin);
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(val.toFixed(3), pad.left - 6, y + 3);
+    }
+
+    // X axis labels
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    const step0 = Math.max(0, data.length - data.length);
+    ctx.fillText(step0.toString(), pad.left, h - 4);
+    ctx.fillText(data.length.toString(), w - pad.right, h - 4);
+
+    // Data line
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+
+    for (let i = 0; i < data.length; i++) {
+      const x = pad.left + i * xScale;
+      const y = pad.top + (yMax - data[i]) * yScale;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Gradient fill
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+    grad.addColorStop(0, color + '30');
+    grad.addColorStop(1, color + '00');
+
+    ctx.lineTo(pad.left + (data.length - 1) * xScale, pad.top + plotH);
+    ctx.lineTo(pad.left, pad.top + plotH);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Current value indicator
+    const lastVal = data[data.length - 1];
+    const lastX = pad.left + (data.length - 1) * xScale;
+    const lastY = pad.top + (yMax - lastVal) * yScale;
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+}
+
+// ── SSE Connection ──────────────────────────────────────────────────────
+
+const surpriseChart = new LineChart('chartSurprise', '#58a6ff', 'Surprise');
+const stressChart = new LineChart('chartStress', '#f85149', 'Stress');
+
+let connected = false;
+
+function fmt(n, decimals = 3) {
+  if (n === undefined || n === null) return '—';
+  return typeof n === 'number' ? n.toFixed(decimals) : String(n);
+}
+
+function fmtInt(n) {
+  if (n === undefined || n === null) return '—';
+  return Number(n).toLocaleString();
+}
+
+function fmtTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+function updateUI(data) {
+  // Status
+  const dot = document.getElementById('statusDot');
+  dot.classList.add('live');
+  connected = true;
+
+  // Header
+  if (data.device_name) {
+    document.getElementById('deviceName').textContent = data.device_name;
+  }
+  if (data.profile_name) {
+    document.getElementById('profileName').textContent = '(' + data.profile_name + ')';
+  }
+  document.getElementById('stepCount').textContent = fmtInt(data.step);
+  document.getElementById('uptime').textContent = fmtTime(data.uptime_s || 0);
+
+  // Big numbers
+  document.getElementById('valSurprise').textContent = fmt(data.surprise);
+  document.getElementById('valStress').textContent = fmt(data.stress);
+  document.getElementById('valLR').textContent = (1.0 + (data.surprise || 0)).toFixed(2) + 'x';
+
+  // Cache fill
+  const cs = data.cache_stats || {};
+  if (cs.size !== undefined && cs.capacity !== undefined && cs.capacity > 0) {
+    const pct = ((cs.size / cs.capacity) * 100).toFixed(1);
+    document.getElementById('valCacheFill').textContent = pct + '%';
+    document.getElementById('valCacheDetail').textContent =
+      fmtInt(cs.size) + ' / ' + fmtInt(cs.capacity);
+  }
+
+  // Charts
+  if (data.surprise_history) surpriseChart.update(data.surprise_history);
+  if (data.stress_history) stressChart.update(data.stress_history);
+
+  // Cache stats table
+  document.getElementById('csSize').textContent = fmtInt(cs.size);
+  document.getElementById('csCapacity').textContent = fmtInt(cs.capacity);
+  document.getElementById('csInserts').textContent = fmtInt(cs.total_inserts);
+  document.getElementById('csEvictions').textContent = fmtInt(cs.total_evictions);
+  document.getElementById('csLookups').textContent = fmtInt(cs.total_lookups);
+  document.getElementById('csAvgSurprise').textContent = fmt(cs.avg_surprise);
+  document.getElementById('csAvgUtility').textContent = fmt(cs.avg_utility);
+  document.getElementById('csLookupMs').textContent =
+    cs.last_lookup_ms !== undefined ? fmt(cs.last_lookup_ms, 2) + ' ms' : '—';
+
+  // Training stats table
+  const ts = data.training_stats || {};
+  document.getElementById('tsDocs').textContent = fmtInt(ts.documents_encoded);
+  document.getElementById('tsPayloads').textContent = fmtInt(ts.payloads_consumed);
+  document.getElementById('tsQueue').textContent = fmtInt(ts.queue_current_size);
+  document.getElementById('tsRate').textContent =
+    ts.encoding_docs_per_sec !== undefined ? fmt(ts.encoding_docs_per_sec, 1) + ' docs/s' : '—';
+  document.getElementById('tsElapsed').textContent =
+    ts.elapsed_seconds !== undefined ? fmtTime(ts.elapsed_seconds) : '—';
+  document.getElementById('tsBusy').textContent =
+    ts.producer_busy_pct !== undefined ? fmt(ts.producer_busy_pct, 1) + '%' : '—';
+}
+
+function connectSSE() {
+  const es = new EventSource('/api/stream');
+
+  es.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      updateUI(data);
+    } catch (e) {
+      console.warn('Parse error:', e);
+    }
+  };
+
+  es.onerror = () => {
+    connected = false;
+    document.getElementById('statusDot').classList.remove('live');
+    es.close();
+    // Reconnect after 3 seconds
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+// Boot
+connectSSE();
+
+// Fallback polling in case SSE doesn't connect
+setInterval(() => {
+  if (!connected) {
+    fetch('/api/snapshot')
+      .then(r => r.json())
+      .then(updateUI)
+      .catch(() => {});
+  }
+}, 5000);
+</script>
+</body>
+</html>
