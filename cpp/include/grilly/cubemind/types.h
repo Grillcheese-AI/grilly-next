@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 namespace grilly {
@@ -30,6 +31,32 @@ struct BitpackedVec {
     uint32_t dim;   // Original bipolar dimension (e.g., 10240)
 
     uint32_t numWords() const { return (dim + 31) / 32; }
+
+    /// Element-wise XOR (transition delta for hippocampal consolidation).
+    BitpackedVec operator^(const BitpackedVec& other) const {
+        BitpackedVec result;
+        result.dim = dim;
+        result.data.resize(data.size());
+        for (size_t i = 0; i < data.size(); ++i)
+            result.data[i] = data[i] ^ other.data[i];
+        return result;
+    }
+
+    bool operator==(const BitpackedVec& other) const {
+        return dim == other.dim && data == other.data;
+    }
+};
+
+/// FNV-1a hash for BitpackedVec (unordered_map key support).
+struct BitpackedVecHash {
+    size_t operator()(const BitpackedVec& v) const {
+        size_t h = 14695981039346656037ULL;  // FNV offset basis
+        for (uint32_t w : v.data) {
+            h ^= static_cast<size_t>(w);
+            h *= 1099511628211ULL;           // FNV prime
+        }
+        return h;
+    }
 };
 
 /// Per-entry emotional state for hippocampal cache.

@@ -14,8 +14,13 @@ try:
 
     NATIVE_AVAILABLE = True
 except ImportError:
-    _core = None
-    NATIVE_AVAILABLE = False
+    try:
+        from grilly import grilly_core as _core
+
+        NATIVE_AVAILABLE = True
+    except ImportError:
+        _core = None
+        NATIVE_AVAILABLE = False
 
 
 # ── Device wrapper ────────────────────────────────────────────────────────
@@ -223,6 +228,11 @@ SemanticAssigner = _core.SemanticAssigner if NATIVE_AVAILABLE else None
 ParsedDocument = _core.ParsedDocument if NATIVE_AVAILABLE else None
 TrainingPayload = _core.TrainingPayload if NATIVE_AVAILABLE else None
 TrainingPipeline = _core.TrainingPipeline if NATIVE_AVAILABLE else None
+
+
+# ── SystemProfile: Hardware Configuration ─────────────────────────────
+
+SystemProfile = _core.SystemProfile if NATIVE_AVAILABLE else None
 
 
 # ── OpGraph ──────────────────────────────────────────────────────────────

@@ -72,7 +72,8 @@ def load_svc_facts(data_dir, max_facts=50000):
 
 def run_phase2(data_dir, dim=10240, queue_depth=2048, max_docs=None,
                report_interval=10000, cache_capacity=500_000,
-               max_facts=50000, use_world_model=True):
+               max_facts=50000, use_world_model=True,
+               dream_interval=10000, hippocampus_capacity=50000):
     """Run Phase 2 adaptive gradient pretraining."""
 
     import grilly_core
@@ -130,6 +131,17 @@ def run_phase2(data_dir, dim=10240, queue_depth=2048, max_docs=None,
         print(f"  Facts: {world_model.fact_count:,d}  "
               f"Constraints: {world_model.constraint_count:,d}  "
               f"({elapsed:.2f}s)")
+        print()
+
+    # -- 2c. Initialize Hippocampal Consolidator ---------------------------
+    hippocampus = None
+    prev_vsa_data = None
+    if use_world_model and world_model is not None:
+        print(f"Initializing HippocampalConsolidator "
+              f"(capacity={hippocampus_capacity:,d}, "
+              f"dream every {dream_interval:,d} docs)...")
+        hippocampus = grilly_core.HippocampalConsolidator(
+            max_capacity=hippocampus_capacity)
         print()
 
     # -- 3. Start C++ streaming pipeline -----------------------------------
@@ -256,6 +268,25 @@ def run_phase2(data_dir, dim=10240, queue_depth=2048, max_docs=None,
         #
         vsa_cache.insert_packed(vsa_data, surprise=surprise, stress=0.0)
 
+        # -- F. Record episode for hippocampal consolidation ---------------
+        if hippocampus is not None:
+            if prev_vsa_data is not None:
+                hippocampus.record_episode(prev_vsa_data, vsa_data)
+            prev_vsa_data = vsa_data.copy()
+
+        # -- Dream cycle (hippocampal consolidation) ------------------------
+        if (hippocampus is not None and consumed > 0
+                and consumed % dream_interval == 0):
+            t_dream = time.perf_counter()
+            dream_report = hippocampus.dream(world_model, cycles=128)
+            dream_ms = (time.perf_counter() - t_dream) * 1000
+            print(f"  [DREAM @ {consumed:>7,d}]  "
+                  f"replayed={dream_report.episodes_replayed:,d}  "
+                  f"rules={dream_report.new_rules_extracted}  "
+                  f"synthetic={dream_report.synthetic_dreams}  "
+                  f"time={dream_ms:.1f}ms  "
+                  f"facts_now={world_model.fact_count:,d}")
+
         # -- Periodic reporting --------------------------------------------
         now = time.perf_counter()
         if consumed % report_interval == 0 or (now - t_last_report) > 10.0:
@@ -368,6 +399,10 @@ if __name__ == "__main__":
                         help="Max SVC facts to load into WorldModel")
     parser.add_argument("--no-world-model", action="store_true",
                         help="Disable WorldModel coherence checks")
+    parser.add_argument("--dream-interval", type=int, default=10_000,
+                        help="Run dream consolidation every N documents")
+    parser.add_argument("--hippocampus-capacity", type=int, default=50_000,
+                        help="Max episodes in hippocampal buffer")
     args = parser.parse_args()
 
     run_phase2(
@@ -379,4 +414,6 @@ if __name__ == "__main__":
         cache_capacity=args.cache_capacity,
         max_facts=args.max_facts,
         use_world_model=not args.no_world_model,
+        dream_interval=args.dream_interval,
+        hippocampus_capacity=args.hippocampus_capacity,
     )

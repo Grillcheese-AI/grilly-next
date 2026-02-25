@@ -37,7 +37,9 @@
 #include "grilly/temporal/temporal_encoder.h"
 #include "grilly/temporal/counterfactual.h"
 #include "grilly/temporal/vulkan_temporal.h"
+#include "grilly/temporal/hippocampus.h"
 #include "grilly/autograd/autograd.h"
+#include "grilly/system_profile.h"
 
 namespace py = pybind11;
 
@@ -2076,12 +2078,97 @@ PYBIND11_MODULE(grilly_core, m) {
              },
              py::arg("subject"), py::arg("relation"), py::arg("object"),
              "Encode a (S, R, O) triple into a bitpacked vector")
+        .def("add_fact_vec",
+             [](grilly::cognitive::WorldModel& wm,
+                py::array_t<uint32_t> fact_vec) {
+                 auto buf = fact_vec.request();
+                 uint32_t dim = wm.dim();
+                 uint32_t words = (dim + 31) / 32;
+
+                 grilly::cubemind::BitpackedVec vec;
+                 vec.dim = dim;
+                 vec.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + words);
+
+                 wm.add_fact_vec(vec);
+             },
+             py::arg("fact_vec"),
+             "Add a pre-encoded bitpacked fact vector (no negation)")
         .def_property_readonly("fact_count",
              &grilly::cognitive::WorldModel::fact_count)
         .def_property_readonly("constraint_count",
              &grilly::cognitive::WorldModel::constraint_count)
         .def_property_readonly("dim",
              &grilly::cognitive::WorldModel::dim);
+
+    // ── Hippocampal Consolidator (Offline Dream Cycle) ──────────────────
+
+    py::class_<grilly::DreamReport>(m, "DreamReport")
+        .def_readonly("episodes_replayed",
+                      &grilly::DreamReport::episodes_replayed)
+        .def_readonly("synthetic_dreams",
+                      &grilly::DreamReport::synthetic_dreams)
+        .def_readonly("new_rules_extracted",
+                      &grilly::DreamReport::new_rules_extracted);
+
+    py::class_<grilly::HippocampalConsolidator>(m, "HippocampalConsolidator")
+        .def(py::init<uint32_t>(),
+             py::arg("max_capacity") = 10000,
+             "Create a hippocampal consolidator with FIFO episode buffer")
+        .def("record_episode",
+             [](grilly::HippocampalConsolidator& hc,
+                py::array_t<uint32_t> state_t,
+                py::array_t<uint32_t> state_t1) {
+                 auto buf_t = state_t.request();
+                 auto buf_t1 = state_t1.request();
+
+                 grilly::cubemind::BitpackedVec vec_t;
+                 vec_t.dim = static_cast<uint32_t>(buf_t.size) * 32;
+                 vec_t.data.assign(
+                     static_cast<uint32_t*>(buf_t.ptr),
+                     static_cast<uint32_t*>(buf_t.ptr) + buf_t.size);
+
+                 grilly::cubemind::BitpackedVec vec_t1;
+                 vec_t1.dim = static_cast<uint32_t>(buf_t1.size) * 32;
+                 vec_t1.data.assign(
+                     static_cast<uint32_t*>(buf_t1.ptr),
+                     static_cast<uint32_t*>(buf_t1.ptr) + buf_t1.size);
+
+                 hc.record_episode(vec_t, vec_t1);
+             },
+             py::arg("state_t"), py::arg("state_t1"),
+             "Record a (state_t, state_t+1) transition episode")
+        .def("dream",
+             [](grilly::HippocampalConsolidator& hc,
+                grilly::cognitive::WorldModel& wm,
+                uint32_t cycles) {
+                 return hc.dream(wm, cycles);
+             },
+             py::arg("world_model"), py::arg("cycles") = 128,
+             "Run offline dream consolidation, returns DreamReport")
+        .def_property_readonly("buffer_size",
+             &grilly::HippocampalConsolidator::buffer_size);
+
+    // ── SystemProfile: Hardware Configuration Loader ────────────────────
+
+    py::class_<grilly::SystemProfile>(m, "SystemProfile")
+        .def_readonly("device_name", &grilly::SystemProfile::deviceName)
+        .def_readonly("subgroup_size", &grilly::SystemProfile::subgroupSize)
+        .def_readonly("arena_size_bytes", &grilly::SystemProfile::arenaSizeBytes)
+        .def_readonly("vsa_dim", &grilly::SystemProfile::vsaDim)
+        .def_readonly("max_cache_capacity", &grilly::SystemProfile::maxCacheCapacity)
+        .def_readonly("max_constraint_capacity", &grilly::SystemProfile::maxConstraintCapacity)
+        .def_readonly("surprise_threshold", &grilly::SystemProfile::surpriseThreshold)
+        .def_readonly("coherence_threshold", &grilly::SystemProfile::coherenceThreshold)
+        .def_readonly("thinking_steps", &grilly::SystemProfile::thinkingSteps)
+        .def_readonly("batch_size", &grilly::SystemProfile::batchSize)
+        .def_readonly("workgroup_size", &grilly::SystemProfile::workgroupSize)
+        .def_property_readonly("entries_per_wg",
+             &grilly::SystemProfile::entriesPerWG)
+        .def_static("load", &grilly::SystemProfile::load,
+             py::arg("path"), py::arg("profile_name"),
+             "Load a hardware profile from profiles.json");
 
     // ── Autograd: TapeArena + Wengert List Backward Engine ──────────────
 
