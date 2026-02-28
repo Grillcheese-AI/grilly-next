@@ -3,22 +3,20 @@ requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "grilly"
-version = "0.5.0"
+name = "grilly-next"
+version = "0.1.0"
 description = "GPU-accelerated neural network operations using Vulkan compute shaders"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
     {name = "Nicolas Cloutier", email = "ncloutier@grillcheeseai.com"}
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: C++",
@@ -32,6 +30,7 @@ keywords = [
 
 dependencies = [
     "numpy>=1.24",
+    "grilly>=0.4.5",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +40,7 @@ ml = [
     "sentence-transformers>=2.2",
 ]
 legacy = [
-    # Required for unported Python backend ops (SNN, memory, etc.)
+    # Retained for compatibility — SNN and core ops now in grilly>=0.4.5 C++ backend
     "vulkan>=1.3.0",
 ]
 dev = [
@@ -52,7 +51,7 @@ dev = [
     "isort>=5.12.0",
     "mypy>=1.5.0",
 ]
-all = ["grilly[ml,legacy,dev]"]
+all = ["grilly-next[ml,legacy,dev]"]
 
 [project.urls]
 Homepage = "https://grillcheeseai.com"
@@ -63,8 +62,8 @@ Documentation = "https://grillcheeseai.com"
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-wheel.packages = ["src/grilly"]
-wheel.install-dir = "grilly"
+wheel.packages = ["src/grilly_next"]
+wheel.install-dir = "grilly_next"
 
 [tool.scikit-build.cmake.define]
 # Vulkan SDK path — scikit-build passes this to CMake
@@ -115,9 +114,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/**/*.py" = ["F401"]
-"src/grilly/utils/numba_ops.py" = ["F401"]
-"src/grilly/backend/snn_compute.py" = ["F401"]
-"src/grilly/nn/module.py" = ["F401"]
+"src/grilly_next/utils/numba_ops.py" = ["F401"]
+"src/grilly_next/backend/snn_compute.py" = ["F401"]
+"src/grilly_next/nn/module.py" = ["F401"]
 
 [tool.isort]
 profile = "black"
@@ -138,18 +137,18 @@ warn_unused_configs = true
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["src/grilly"]
+source = ["src/grilly_next"]
 omit = [
     "tests/*",
     "benchmarks/*",
     "examples/*",
-    "src/grilly/utils/vulkan_sentence_transformer.py",
-    "src/grilly/utils/hippocampal_checkpoint.py",
-    "src/grilly/utils/visualization.py",
-    "src/grilly/backend/vma_wrapper.py",
-    "src/grilly/backend/snn_visualizer.py",
-    "src/grilly/backend/hilbert.py",
-    "src/grilly/backend/_glu_append.py",
+    "src/grilly_next/utils/vulkan_sentence_transformer.py",
+    "src/grilly_next/utils/hippocampal_checkpoint.py",
+    "src/grilly_next/utils/visualization.py",
+    "src/grilly_next/backend/vma_wrapper.py",
+    "src/grilly_next/backend/snn_visualizer.py",
+    "src/grilly_next/backend/hilbert.py",
+    "src/grilly_next/backend/_glu_append.py",
 ]
 branch = true
 

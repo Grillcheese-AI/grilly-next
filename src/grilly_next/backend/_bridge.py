@@ -14,13 +14,8 @@ try:
 
     NATIVE_AVAILABLE = True
 except ImportError:
-    try:
-        from grilly import grilly_core as _core
-
-        NATIVE_AVAILABLE = True
-    except ImportError:
-        _core = None
-        NATIVE_AVAILABLE = False
+    _core = None
+    NATIVE_AVAILABLE = False
 
 
 # ── Device wrapper ────────────────────────────────────────────────────────

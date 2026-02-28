@@ -37,7 +37,7 @@ except Exception as e:
     print(f"[SKIP] C++ backend: {e}")
 
 try:
-    from grilly.backend.compute import VulkanCompute
+    from grilly_next.backend.compute import VulkanCompute
     py_backend = VulkanCompute()
     HAS_PY = True
 except Exception as e:

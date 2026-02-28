@@ -8,8 +8,8 @@ Legacy nn/functional/optim layers have been removed — use grilly_core directly
 or through backend._bridge for all GPU operations.
 """
 
-from grilly.backend import VULKAN_AVAILABLE
-from grilly.backend.compute import VulkanCompute
+from grilly_next.backend import VULKAN_AVAILABLE
+from grilly_next.backend.compute import VulkanCompute
 
 Compute = VulkanCompute
 
@@ -20,6 +20,6 @@ __all__ = [
 ]
 
 try:
-    from grilly._version import version as __version__
+    from grilly_next._version import version as __version__
 except ImportError:
     __version__ = "0.5.0.dev0"

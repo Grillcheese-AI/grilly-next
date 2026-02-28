@@ -6,13 +6,20 @@ import numpy as np
 import pytest
 
 try:
-    import grilly
-    from grilly.backend import VULKAN_AVAILABLE
+    import grilly_next
+    from grilly_next.backend import VULKAN_AVAILABLE
 
     GRILLY_AVAILABLE = True
 except ImportError:
     GRILLY_AVAILABLE = False
     VULKAN_AVAILABLE = False
+
+try:
+    import grilly_core
+
+    GRILLY_CORE_AVAILABLE = True
+except ImportError:
+    GRILLY_CORE_AVAILABLE = False
 
 
 class TestGrillyImports:
@@ -21,31 +28,40 @@ class TestGrillyImports:
     def test_import_grilly(self):
         """Test basic grilly import"""
         assert GRILLY_AVAILABLE, "grilly package not available"
-        assert hasattr(grilly, "VULKAN_AVAILABLE")
+        assert hasattr(grilly_next, "VULKAN_AVAILABLE")
 
     def test_import_compute(self):
         """Test Compute class import"""
-        from grilly import Compute, VulkanCompute
+        from grilly_next import Compute, VulkanCompute
 
         assert Compute is VulkanCompute
 
-    def test_import_snn_compute(self):
-        """Test SNNCompute import"""
-        from grilly import SNNCompute
-
-        assert SNNCompute is not None
-
-    def test_import_learning(self):
-        """Test Learning class import"""
-        from grilly import Learning, VulkanLearning
-
-        assert Learning is VulkanLearning
-
     def test_vulkan_available_flag(self):
         """Test VULKAN_AVAILABLE flag"""
-        from grilly.backend import VULKAN_AVAILABLE
+        from grilly_next.backend import VULKAN_AVAILABLE
 
         assert isinstance(VULKAN_AVAILABLE, bool)
+
+    def test_import_bridge(self):
+        """Test bridge module exposes core wrappers"""
+        from grilly_next.backend import _bridge
+
+        assert hasattr(_bridge, "NATIVE_AVAILABLE")
+        assert hasattr(_bridge, "create_device")
+        assert hasattr(_bridge, "linear")
+        assert hasattr(_bridge, "relu")
+        assert hasattr(_bridge, "gelu")
+        assert hasattr(_bridge, "silu")
+        assert hasattr(_bridge, "layernorm")
+        assert hasattr(_bridge, "flash_attention2")
+
+    def test_import_grilly_core(self):
+        """Test grilly_core C++ extension is importable"""
+        assert GRILLY_CORE_AVAILABLE, "grilly_core not available"
+        assert hasattr(grilly_core, "Device")
+        assert hasattr(grilly_core, "linear")
+        assert hasattr(grilly_core, "relu")
+        assert hasattr(grilly_core, "gelu")
 
 
 @pytest.mark.gpu
@@ -54,78 +70,81 @@ class TestComputeInitialization:
     """Test Compute backend initialization"""
 
     def test_compute_init(self):
-        """Test Compute initialization"""
-        from grilly import Compute
+        """Test Compute initialization creates a device"""
+        from grilly_next import Compute
 
         backend = Compute()
-
         assert backend.device is not None
-        assert backend.queue is not None
-        assert len(backend.shaders) > 0
-
-    def test_compute_shaders_loaded(self):
-        """Test that shaders are loaded"""
-        from grilly import Compute
-
-        backend = Compute()
-
-        assert isinstance(backend.shaders, dict)
-        assert len(backend.shaders) > 0
-
-    def test_compute_cleanup(self):
-        """Test Compute cleanup"""
-        from grilly import Compute
-
-        backend = Compute()
         backend.cleanup()
 
-        # After cleanup, device should be destroyed
-        # (exact behavior depends on implementation)
+    def test_compute_cleanup(self):
+        """Test Compute cleanup nulls the device"""
+        from grilly_next import Compute
+
+        backend = Compute()
+        assert backend.device is not None
+        backend.cleanup()
+        assert backend.device is None
+
+    def test_compute_has_core_ops(self):
+        """Test Compute exposes core operation methods"""
+        from grilly_next import Compute
+
+        backend = Compute()
+        assert callable(backend.linear)
+        assert callable(backend.activation_relu)
+        assert callable(backend.activation_gelu)
+        assert callable(backend.activation_silu)
+        assert callable(backend.activation_tanh)
+        assert callable(backend.layernorm)
+        assert callable(backend.flash_attention2)
+        assert callable(backend.conv1d)
+        assert callable(backend.conv2d)
+        backend.cleanup()
+
+    def test_compute_has_kv_cache_ops(self):
+        """Test Compute exposes KV cache methods"""
+        from grilly_next import Compute
+
+        backend = Compute()
+        assert callable(backend.create_kv_cache)
+        assert callable(backend.kv_cache_append)
+        assert callable(backend.kv_cache_decode)
+        assert callable(backend.kv_cache_evict_h2o)
+        backend.cleanup()
+
+    def test_compute_has_vsa_ops(self):
+        """Test Compute exposes VSA / CubeMind methods"""
+        from grilly_next import Compute
+
+        backend = Compute()
+        assert callable(backend.hamming_search)
+        assert callable(backend.swizzle_kv)
+        backend.cleanup()
 
 
-class TestSNNComputeInitialization:
-    """Test SNNCompute initialization"""
+@pytest.mark.skipif(not GRILLY_CORE_AVAILABLE, reason="grilly_core not available")
+class TestGrillyCoreDirectAccess:
+    """Test grilly_core C++ extension classes"""
 
-    def test_snn_init_default(self):
-        """Test SNNCompute with default parameters"""
-        from grilly import SNNCompute
+    def test_vsa_cache_class(self):
+        """Test VSACache is accessible from grilly_core"""
+        assert hasattr(grilly_core, "VSACache")
 
-        snn = SNNCompute(use_vulkan=False)
+    def test_text_encoder_class(self):
+        """Test TextEncoder is accessible from grilly_core"""
+        assert hasattr(grilly_core, "TextEncoder")
 
-        assert snn.n_neurons > 0
-        assert snn.membrane is not None
-        assert len(snn.membrane) == snn.n_neurons
+    def test_vsa_encode(self):
+        """Test VSA encode function exists"""
+        assert hasattr(grilly_core, "vsa_encode")
 
-    def test_snn_init_custom_neurons(self):
-        """Test SNNCompute with custom neuron count"""
-        from grilly import SNNCompute
+    def test_blake3_role(self):
+        """Test blake3_role function exists"""
+        assert hasattr(grilly_core, "blake3_role")
 
-        snn = SNNCompute(n_neurons=500, use_vulkan=False)
-
-        assert snn.n_neurons == 500
-        assert len(snn.membrane) == 500
-
-    def test_snn_init_membrane_zero(self):
-        """Test that membrane starts at zero"""
-        from grilly import SNNCompute
-
-        snn = SNNCompute(n_neurons=100, use_vulkan=False)
-
-        assert np.all(snn.membrane == 0)
-        assert np.all(snn.refractory == 0)
-
-    def test_snn_reset(self):
-        """Test SNNCompute reset"""
-        from grilly import SNNCompute
-
-        snn = SNNCompute(n_neurons=100, use_vulkan=False)
-
-        # Modify state
-        snn.membrane = np.ones(100, dtype=np.float32)
-        snn.refractory = np.ones(100, dtype=np.float32)
-
-        # Reset
-        snn.reset()
-
-        assert np.all(snn.membrane == 0)
-        assert np.all(snn.refractory == 0)
+    def test_hippocampal_consolidator_class(self):
+        """Test HippocampalConsolidator is accessible"""
+        assert hasattr(grilly_core, "HippocampalConsolidator")
+        hc = grilly_core.HippocampalConsolidator()
+        assert hc.buffer_size == 0

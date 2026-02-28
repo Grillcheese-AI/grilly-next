@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Python package** (`src/grilly/`) — PyTorch-like API with `nn.Module`, `functional`, optimizers, etc.
 - **GLSL compute shaders** (`shaders/`) — 170+ shaders compiled to SPIR-V
 
-The C++ backend replaces the old Python ctypes Vulkan path for core ops (linear, activations, layernorm, attention, conv). Unported ops (SNN, memory, FFT, etc.) still use the legacy Python backend.
+The C++ Vulkan backend handles all GPU ops via pybind11 (`grilly_core` extension). SNN and standard network ops are available through the `grilly>=0.4.5` dependency, which provides its own C++ backend for both.
 
 ## Common Commands
 
@@ -17,7 +17,7 @@ The C++ backend replaces the old Python ctypes Vulkan path for core ops (linear,
 # Install (builds C++ extension via scikit-build-core + CMake)
 pip install -e .                    # editable install
 pip install -e ".[dev]"             # with dev dependencies
-pip install -e ".[all]"             # everything (ml + legacy + dev)
+pip install -e ".[all]"             # everything (ml + dev)
 
 # Testing
 pytest tests/ -v                                # all tests
@@ -59,8 +59,8 @@ grilly-next/
 ├── src/grilly/                 # Python package
 │   ├── backend/                # GPU dispatch layer
 │   │   ├── _bridge.py          # Thin wrappers around grilly_core
-│   │   ├── compute.py          # VulkanCompute (delegates to C++ or legacy)
-│   │   └── ...                 # Legacy Python ops (kept for unported ops)
+│   │   ├── compute.py          # VulkanCompute (C++ backend only)
+│   │   └── ...                 # Bridge wrappers for grilly_core
 │   ├── nn/                     # PyTorch-like Module subclasses
 │   ├── functional/             # Stateless functional API
 │   ├── optim/                  # Optimizers (Adam, AdamW, SGD, etc.)

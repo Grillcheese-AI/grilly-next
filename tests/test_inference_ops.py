@@ -1,14 +1,17 @@
 """
-Tests for v0.4.0 inference operations: RMSNorm, fused SwiGLU, INT8 GEMM,
-and GQA decode attention.
+Tests for inference operations: layernorm, flash attention,
+linear projections, and CPU reference implementations.
+
+GPU tests use VulkanCompute's actual API surface. CPU fallback
+tests verify numpy reference implementations independently.
 """
 
 import numpy as np
 import pytest
 
 try:
-    from grilly import Compute
-    from grilly.backend import VULKAN_AVAILABLE
+    from grilly_next import Compute
+    from grilly_next.backend import VULKAN_AVAILABLE
 except ImportError:
     pytest.skip("grilly not available", allow_module_level=True)
 
@@ -32,9 +35,6 @@ def _ref_silu(x):
 def _ref_swiglu_fused(x, gate_weights, up_weights):
     """
     Fused SwiGLU: SiLU(x @ gate_proj.T) * (x @ up_proj.T)
-    x: (..., input_dim)
-    gate_weights: (intermediate_size, input_dim)
-    up_weights:   (intermediate_size, input_dim)
     """
     input_dim = x.shape[-1]
     intermediate_size = gate_weights.shape[0]
@@ -95,294 +95,136 @@ def _ref_gqa_decode_attention(query, k_cache, v_cache, num_q_heads,
 
 
 # ===================================================================
-# GPU Tests
+# GPU Tests — grilly-next VulkanCompute API
 # ===================================================================
-
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not VULKAN_AVAILABLE, reason="Vulkan not available")
-class TestRMSNormGPU:
-    """Test RMSNorm on GPU"""
+class TestLayerNormGPU:
+    """Test LayerNorm on GPU (VulkanCompute.layernorm)"""
 
     @pytest.fixture
     def gpu(self):
-        """Initialize GPU backend"""
         backend = Compute()
         yield backend
         backend.cleanup()
 
-    def test_rms_norm_1d(self, gpu):
-        """Test RMSNorm with 1D input (features,)"""
+    def test_layernorm_2d(self, gpu):
+        """Test LayerNorm with 2D input (batch, features)"""
         np.random.seed(42)
-        x = np.random.randn(64).astype(np.float32)
-        result = gpu.fnn.rms_norm(x)
-        expected = _ref_rms_norm(x, np.ones(64, dtype=np.float32), 1e-5)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
+        x = np.random.randn(1, 64).astype(np.float32)
+        gamma = np.ones(64, dtype=np.float32)
+        beta = np.zeros(64, dtype=np.float32)
+        result = gpu.layernorm(x, gamma, beta)
+        assert abs(result.mean()) < 0.15
+        assert abs(result.std() - 1.0) < 0.15
 
-    def test_rms_norm_2d(self, gpu):
-        """Test RMSNorm with 2D input (batch, features)"""
+    def test_layernorm_custom_gamma_beta(self, gpu):
+        """Test LayerNorm with learned gamma/beta"""
         np.random.seed(42)
         x = np.random.randn(4, 128).astype(np.float32)
-        weight = np.ones(128, dtype=np.float32)
-        result = gpu.fnn.rms_norm(x, weight)
-        expected = _ref_rms_norm(x, weight, 1e-5)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_rms_norm_3d(self, gpu):
-        """Test RMSNorm with 3D input (batch, seq, features)"""
-        np.random.seed(42)
-        x = np.random.randn(2, 8, 64).astype(np.float32)
-        weight = np.ones(64, dtype=np.float32)
-        result = gpu.fnn.rms_norm(x, weight)
-        expected = _ref_rms_norm(x, weight, 1e-5)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_rms_norm_default_weight(self, gpu):
-        """Test RMSNorm with default weight (ones)"""
-        np.random.seed(42)
-        x = np.random.randn(4, 64).astype(np.float32)
-        result = gpu.fnn.rms_norm(x)
-        expected = _ref_rms_norm(x, np.ones(64, dtype=np.float32), 1e-5)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_rms_norm_custom_weight(self, gpu):
-        """Test RMSNorm with learned (non-unit) weight"""
-        np.random.seed(42)
-        x = np.random.randn(4, 64).astype(np.float32)
-        weight = np.random.randn(64).astype(np.float32) * 0.5 + 1.0
-        result = gpu.fnn.rms_norm(x, weight)
-        expected = _ref_rms_norm(x, weight, 1e-5)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_rms_norm_numerical_correctness(self, gpu):
-        """Test RMSNorm numerical correctness against numpy reference"""
-        np.random.seed(42)
-        x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
-        weight = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        gamma = np.random.randn(128).astype(np.float32) * 0.5 + 1.0
+        beta = np.random.randn(128).astype(np.float32) * 0.1
         eps = 1e-5
-        result = gpu.fnn.rms_norm(x, weight, eps)
-        expected = _ref_rms_norm(x, weight, eps)
+        result = gpu.layernorm(x, gamma, beta, eps)
+        # Numpy reference: layernorm over last dim
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        normed = (x - mean) / np.sqrt(var + eps)
+        expected = normed * gamma + beta
         np.testing.assert_allclose(result, expected, atol=1e-3)
-        # Output shape must match input shape
-        assert result.shape == x.shape
 
-    def test_rms_norm_eps_affects_output(self, gpu):
+    def test_layernorm_eps(self, gpu):
         """Test that eps parameter changes the output"""
         np.random.seed(42)
-        x = np.random.randn(4, 64).astype(np.float32)
-        weight = np.ones(64, dtype=np.float32)
-        result_small_eps = gpu.fnn.rms_norm(x, weight, eps=1e-8)
-        result_large_eps = gpu.fnn.rms_norm(x, weight, eps=1.0)
-        # Different eps should yield different outputs
+        x = np.random.randn(2, 64).astype(np.float32)
+        gamma = np.ones(64, dtype=np.float32)
+        beta = np.zeros(64, dtype=np.float32)
+        result_small_eps = gpu.layernorm(x, gamma, beta, eps=1e-8)
+        result_large_eps = gpu.layernorm(x, gamma, beta, eps=1.0)
         assert not np.allclose(result_small_eps, result_large_eps, atol=1e-5)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not VULKAN_AVAILABLE, reason="Vulkan not available")
-class TestSwiGLUFusedGPU:
-    """Test fused SwiGLU on GPU"""
+class TestFlashAttention2GPU:
+    """Test flash_attention2 on GPU"""
 
     @pytest.fixture
     def gpu(self):
-        """Initialize GPU backend"""
         backend = Compute()
         yield backend
         backend.cleanup()
 
-    def test_swiglu_fused_2d(self, gpu):
-        """Test fused SwiGLU with 2D input (batch, input_dim)"""
+    def test_flash_attention_basic_shape(self, gpu):
+        """Test flash_attention2 output shape"""
         np.random.seed(42)
-        batch, input_dim, intermediate = 4, 64, 128
-        x = np.random.randn(batch, input_dim).astype(np.float32)
-        gate_w = np.random.randn(intermediate, input_dim).astype(np.float32) * 0.02
-        up_w = np.random.randn(intermediate, input_dim).astype(np.float32) * 0.02
-        result = gpu.fnn.swiglu_fused(x, gate_w, up_w)
-        expected = _ref_swiglu_fused(x, gate_w, up_w)
-        assert result.shape == (batch, intermediate)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
+        batch, heads, seq_len, head_dim = 1, 1, 16, 64
+        Q = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        K = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        V = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        result = gpu.flash_attention2(Q, K, V)
+        assert result.shape == (batch, heads, seq_len, head_dim)
+        assert np.all(np.isfinite(result))
 
-    def test_swiglu_fused_3d(self, gpu):
-        """Test fused SwiGLU with 3D input (batch, seq, input_dim)"""
+    def test_flash_attention_structure(self, gpu):
+        """Test flash_attention2 output has correct structural properties"""
         np.random.seed(42)
-        batch, seq, input_dim, intermediate = 2, 8, 64, 128
-        x = np.random.randn(batch, seq, input_dim).astype(np.float32)
-        gate_w = np.random.randn(intermediate, input_dim).astype(np.float32) * 0.02
-        up_w = np.random.randn(intermediate, input_dim).astype(np.float32) * 0.02
-        result = gpu.fnn.swiglu_fused(x, gate_w, up_w)
-        expected = _ref_swiglu_fused(x, gate_w, up_w)
-        assert result.shape == (batch, seq, intermediate)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
+        batch, heads, seq_len, head_dim = 1, 1, 8, 64
+        Q = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        K = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        V = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        result = gpu.flash_attention2(Q, K, V)
 
-    def test_swiglu_fused_numerical_correctness(self, gpu):
-        """Test numerical correctness against SiLU(x @ gate.T) * (x @ up.T)"""
-        np.random.seed(42)
-        x = np.array([[1.0, 0.5, -0.3]], dtype=np.float32)
-        gate_w = np.random.randn(4, 3).astype(np.float32) * 0.1
-        up_w = np.random.randn(4, 3).astype(np.float32) * 0.1
-        result = gpu.fnn.swiglu_fused(x, gate_w, up_w)
-        expected = _ref_swiglu_fused(x, gate_w, up_w)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
+        assert result.shape == (batch, heads, seq_len, head_dim)
+        assert np.all(np.isfinite(result))
+        # Output is a convex combination of V rows — bounded by V's range
+        assert np.all(result >= V.min() - 0.01)
+        assert np.all(result <= V.max() + 0.01)
 
-    def test_swiglu_fused_output_shape(self, gpu):
-        """Test output shape is (batch, intermediate_size)"""
+    def test_flash_attention_with_mask(self, gpu):
+        """Test flash_attention2 with causal mask"""
         np.random.seed(42)
-        batch, input_dim, intermediate = 8, 32, 96
-        x = np.random.randn(batch, input_dim).astype(np.float32)
-        gate_w = np.random.randn(intermediate, input_dim).astype(np.float32) * 0.02
-        up_w = np.random.randn(intermediate, input_dim).astype(np.float32) * 0.02
-        result = gpu.fnn.swiglu_fused(x, gate_w, up_w)
-        assert result.shape == (batch, intermediate)
+        batch, heads, seq_len, head_dim = 1, 1, 8, 64
+        Q = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        K = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        V = np.random.randn(batch, heads, seq_len, head_dim).astype(np.float32) * 0.1
+        mask = np.tril(np.ones((batch, heads, seq_len, seq_len), dtype=np.float32))
+        result = gpu.flash_attention2(Q, K, V, mask=mask)
+        assert result.shape == (batch, heads, seq_len, head_dim)
+        assert np.all(np.isfinite(result))
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not VULKAN_AVAILABLE, reason="Vulkan not available")
-class TestGEMMInt8GPU:
-    """Test INT8 weight-only GEMM on GPU"""
+class TestLinearGPU:
+    """Test linear projection on GPU"""
 
     @pytest.fixture
     def gpu(self):
-        """Initialize GPU backend"""
         backend = Compute()
         yield backend
         backend.cleanup()
 
-    @staticmethod
-    def _make_int8_weights(N, K, group_size):
-        """Create random INT8 weights and matching per-group scales."""
-        w_int8 = np.random.randint(-127, 127, size=(N, K), dtype=np.int8)
-        num_groups = (K + group_size - 1) // group_size
-        scales = np.random.rand(N, num_groups).astype(np.float32) * 0.1 + 0.01
-        return w_int8, scales
-
-    def test_gemm_int8_known_values(self, gpu):
-        """Test INT8 GEMM with simple known values"""
+    def test_linear_numerical(self, gpu):
+        """Test linear matches x @ W^T"""
         np.random.seed(42)
-        M, K, N, group_size = 2, 8, 4, 8
-        activations = np.ones((M, K), dtype=np.float32)
-        w_int8 = np.ones((N, K), dtype=np.int8) * 2
-        num_groups = (K + group_size - 1) // group_size
-        scales = np.ones((N, num_groups), dtype=np.float32) * 0.5
-        result = gpu.fnn.gemm_int8(activations, w_int8, scales, group_size)
-        expected = _ref_gemm_int8(activations, w_int8, scales, group_size)
+        x = np.random.randn(4, 64).astype(np.float32)
+        weight = np.random.randn(32, 64).astype(np.float32) * 0.1
+        result = gpu.linear(x, weight)
+        expected = x @ weight.T
+        assert result.shape == (4, 32)
         np.testing.assert_allclose(result, expected, atol=1e-3)
 
-    def test_gemm_int8_output_shape(self, gpu):
-        """Test output shape (M, N) from (M, K) @ (N, K).T"""
+    def test_linear_with_bias(self, gpu):
+        """Test linear with bias"""
         np.random.seed(42)
-        M, K, N, group_size = 4, 128, 64, 64
-        activations = np.random.randn(M, K).astype(np.float32)
-        w_int8, scales = self._make_int8_weights(N, K, group_size)
-        result = gpu.fnn.gemm_int8(activations, w_int8, scales, group_size)
-        assert result.shape == (M, N)
-
-    def test_gemm_int8_numerical_correctness(self, gpu):
-        """Test numerical correctness against dequantized numpy reference"""
-        np.random.seed(42)
-        M, K, N, group_size = 4, 128, 64, 64
-        activations = np.random.randn(M, K).astype(np.float32)
-        w_int8, scales = self._make_int8_weights(N, K, group_size)
-        result = gpu.fnn.gemm_int8(activations, w_int8, scales, group_size)
-        expected = _ref_gemm_int8(activations, w_int8, scales, group_size)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    @pytest.mark.parametrize("group_size", [32, 64, 128])
-    def test_gemm_int8_group_sizes(self, gpu, group_size):
-        """Test INT8 GEMM with different group sizes"""
-        np.random.seed(42)
-        M, K, N = 4, 256, 64
-        activations = np.random.randn(M, K).astype(np.float32)
-        w_int8, scales = self._make_int8_weights(N, K, group_size)
-        result = gpu.fnn.gemm_int8(activations, w_int8, scales, group_size)
-        expected = _ref_gemm_int8(activations, w_int8, scales, group_size)
-        assert result.shape == (M, N)
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not VULKAN_AVAILABLE, reason="Vulkan not available")
-class TestGQADecodeAttentionGPU:
-    """Test GQA decode attention on GPU"""
-
-    @pytest.fixture
-    def gpu(self):
-        """Initialize GPU backend"""
-        backend = Compute()
-        yield backend
-        backend.cleanup()
-
-    def test_gqa_decode_basic_shape(self, gpu):
-        """Test basic shape: query (1,1,24,128) -> output (1,1,24,128)"""
-        np.random.seed(42)
-        batch, cache_len, num_q, num_kv, head_dim = 1, 32, 24, 8, 128
-        query = np.random.randn(batch, 1, num_q, head_dim).astype(np.float32)
-        k_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32)
-        v_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32)
-        result = gpu.attention.gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        assert result.shape == (batch, 1, num_q, head_dim)
-
-    def test_gqa_decode_gqa_mapping(self, gpu):
-        """Test GQA mapping: 24 query heads, 8 KV heads (group_size=3)"""
-        np.random.seed(42)
-        batch, cache_len, num_q, num_kv, head_dim = 1, 16, 24, 8, 64
-        query = np.random.randn(batch, 1, num_q, head_dim).astype(np.float32)
-        k_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32)
-        v_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32)
-        result = gpu.attention.gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        expected = _ref_gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_gqa_decode_numerical_correctness(self, gpu):
-        """Test numerical correctness against numpy reference"""
-        np.random.seed(42)
-        batch, cache_len, num_q, num_kv, head_dim = 1, 32, 24, 8, 128
-        query = np.random.randn(batch, 1, num_q, head_dim).astype(np.float32) * 0.1
-        k_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
-        v_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
-        result = gpu.attention.gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        expected = _ref_gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_gqa_decode_different_cache_lengths(self, gpu):
-        """Test GQA decode with different KV cache lengths"""
-        np.random.seed(42)
-        batch, num_q, num_kv, head_dim = 1, 12, 4, 64
-        for cache_len in [1, 8, 32, 64]:
-            query = np.random.randn(batch, 1, num_q, head_dim).astype(np.float32) * 0.1
-            k_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
-            v_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
-            result = gpu.attention.gqa_decode_attention(
-                query, k_cache, v_cache, num_q, num_kv, head_dim
-            )
-            expected = _ref_gqa_decode_attention(
-                query, k_cache, v_cache, num_q, num_kv, head_dim
-            )
-            assert result.shape == (batch, 1, num_q, head_dim)
-            np.testing.assert_allclose(result, expected, atol=1e-3)
-
-    def test_gqa_decode_batch_gt_1(self, gpu):
-        """Test GQA decode with batch_size > 1"""
-        np.random.seed(42)
-        batch, cache_len, num_q, num_kv, head_dim = 4, 16, 12, 4, 64
-        query = np.random.randn(batch, 1, num_q, head_dim).astype(np.float32) * 0.1
-        k_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
-        v_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
-        result = gpu.attention.gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        expected = _ref_gqa_decode_attention(
-            query, k_cache, v_cache, num_q, num_kv, head_dim
-        )
-        assert result.shape == (batch, 1, num_q, head_dim)
+        x = np.random.randn(8, 32).astype(np.float32)
+        weight = np.random.randn(16, 32).astype(np.float32) * 0.1
+        bias = np.random.randn(16).astype(np.float32) * 0.1
+        result = gpu.linear(x, weight, bias)
+        expected = x @ weight.T + bias
+        assert result.shape == (8, 16)
         np.testing.assert_allclose(result, expected, atol=1e-3)
 
 
@@ -401,18 +243,12 @@ class TestRMSNormCPUFallback:
         weight = np.random.randn(128).astype(np.float32) * 0.5 + 1.0
         eps = 1e-5
 
-        # Compute via numpy reference directly
         expected = _ref_rms_norm(x, weight, eps)
 
-        # Verify the reference implementation itself is mathematically sound
         mean_sq = np.mean(x ** 2, axis=-1, keepdims=True)
         manual = x * (1.0 / np.sqrt(mean_sq + eps)) * weight
         np.testing.assert_allclose(expected, manual, atol=1e-5)
-
-        # Verify shape preservation
         assert expected.shape == x.shape
-
-        # Verify non-trivial transformation (output differs from input)
         assert not np.allclose(x, expected)
 
     def test_rms_norm_cpu_1d(self):
@@ -453,7 +289,6 @@ class TestSwiGLUFusedCPUFallback:
 
         result = _ref_swiglu_fused(x, gate_w, up_w)
 
-        # Verify against manual step-by-step computation
         gate = x @ gate_w.T
         up = x @ up_w.T
         silu_gate = gate * (1.0 / (1.0 + np.exp(-np.clip(gate, -88, 88))))
@@ -489,7 +324,6 @@ class TestGEMMInt8CPUFallback:
 
         result = _ref_gemm_int8(activations, w_int8, scales, group_size)
 
-        # Verify against full dequantize + matmul
         w_fp32 = np.zeros((N, K), dtype=np.float32)
         for g in range(num_groups):
             k_s = g * group_size
@@ -530,9 +364,6 @@ class TestGQADecodeAttentionCPUFallback:
             query, k_cache, v_cache, num_q, num_kv, head_dim
         )
         assert result.shape == (batch, 1, num_q, head_dim)
-
-        # Verify softmax: output should be a weighted combination of values,
-        # so each head's output should lie within the range of the value cache
         assert np.all(np.isfinite(result))
 
     def test_gqa_decode_cpu_batch_gt_1(self):
@@ -548,7 +379,6 @@ class TestGQADecodeAttentionCPUFallback:
         )
         assert result.shape == (batch, 1, num_q, head_dim)
 
-        # Each batch item should produce independent output
         r0 = _ref_gqa_decode_attention(
             query[0:1], k_cache[0:1], v_cache[0:1], num_q, num_kv, head_dim
         )
@@ -562,7 +392,7 @@ class TestGQADecodeAttentionCPUFallback:
         """Test GQA head grouping: query heads map to correct KV heads"""
         np.random.seed(42)
         batch, cache_len, num_q, num_kv, head_dim = 1, 8, 6, 2, 32
-        kv_group_size = num_q // num_kv  # 3
+        kv_group_size = num_q // num_kv
 
         query = np.random.randn(batch, 1, num_q, head_dim).astype(np.float32) * 0.1
         k_cache = np.random.randn(batch, cache_len, num_kv, head_dim).astype(np.float32) * 0.1
@@ -572,9 +402,6 @@ class TestGQADecodeAttentionCPUFallback:
             query, k_cache, v_cache, num_q, num_kv, head_dim
         )
 
-        # Query heads 0,1,2 should all use KV head 0
-        # Query heads 3,4,5 should all use KV head 1
-        # Verify by computing each head individually
         q_2d = query.reshape(batch, num_q, head_dim)
         scale = 1.0 / np.sqrt(head_dim)
         for qh in range(num_q):

@@ -41,7 +41,7 @@ except Exception as e:
 
 # Python-Vulkan backend
 try:
-    from grilly.backend.compute import VulkanCompute
+    from grilly_next.backend.compute import VulkanCompute
 
     py_backend = VulkanCompute()
     HAS_PYTHON_VK = True

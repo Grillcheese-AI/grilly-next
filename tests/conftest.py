@@ -17,8 +17,8 @@ def pytest_configure(config):
 
 
 try:
-    import grilly
-    from grilly.backend import VULKAN_AVAILABLE
+    import grilly_next as grilly
+    from grilly_next.backend import VULKAN_AVAILABLE
 
     GRILLY_AVAILABLE = True
 except ImportError:
@@ -32,7 +32,7 @@ def gpu_backend():
     if not VULKAN_AVAILABLE:
         pytest.skip("Vulkan not available")
     try:
-        from grilly import Compute
+        from grilly_next import Compute
 
         backend = Compute()
         yield backend

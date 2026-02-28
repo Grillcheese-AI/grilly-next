@@ -2,10 +2,10 @@
 
 import time
 
-import grilly
+import grilly_next
 import numpy as np
 
-backend = grilly.Compute()
+backend = grilly_next.Compute()
 
 sizes = [128, 256, 512, 1024, 2048]
 warmup = 3

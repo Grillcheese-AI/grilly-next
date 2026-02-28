@@ -21,11 +21,11 @@ import numpy as np
 # ── Import grilly_core (C++ extension) ──────────────────────────────────
 
 try:
-    from grilly import grilly_core as _core
+    import grilly_next
     HAS_NATIVE = True
 except ImportError:
     try:
-        import grilly_core as _core
+        import grilly_next as _core
         HAS_NATIVE = True
     except ImportError:
         HAS_NATIVE = False

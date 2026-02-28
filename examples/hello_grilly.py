@@ -1,9 +1,9 @@
 """Minimal forward + backward pass with Grilly autograd."""
 
-import grilly.nn as nn
+import grilly_next.backend._bridge as nn
 
 # Create a linear layer and random input with gradient tracking
-layer = nn.Linear(128, 10)
+layer = nn.linear(128, 10, 0)
 x = nn.randn(32, 128, requires_grad=True)
 
 # Forward pass

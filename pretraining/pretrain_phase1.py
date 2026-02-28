@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import grilly_next.backend as grilly_core
 
 
 def load_jsonl(path, max_rows=None):
@@ -74,7 +75,7 @@ def collect_vocab(rows):
 
 def register_blake3_fillers(pipeline, vocab, dim):
     """Register BLAKE3 deterministic fillers for all vocabulary tokens."""
-    import grilly_core
+    
 
     encoder = pipeline.encoder()
     registered = 0
@@ -90,7 +91,7 @@ def run_pretraining(data_dir, max_rows=None, dim=10240, queue_depth=2048,
                     report_interval=10000):
     """Run the full Phase 1 pretraining pipeline."""
 
-    import grilly_core
+    
 
     print("=" * 70)
     print("  CubeMind Phase 1 Pretraining")
@@ -146,7 +147,10 @@ def run_pretraining(data_dir, max_rows=None, dim=10240, queue_depth=2048,
 
     # ── 3. Initialize pipeline ────────────────────────────────────────
     print("Initializing C++ TrainingPipeline...")
-    pipeline = grilly_core.TrainingPipeline(
+
+    import grilly_next.backend._bridge as gc
+
+    pipeline = gc.TrainingPipeline(
         dim=dim, ft_dim=300, queue_depth=queue_depth)
 
     # Register BLAKE3 fillers for all vocabulary tokens

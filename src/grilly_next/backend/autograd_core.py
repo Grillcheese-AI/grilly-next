@@ -368,7 +368,7 @@ class AutogradEngine:
         """Lazy initialization of Vulkan backend."""
         if self._backend is None:
             try:
-                from grilly import Compute
+                from grilly_next import Compute
 
                 self._backend = Compute()
             except Exception:
@@ -476,7 +476,7 @@ class VulkanBackwardOps:
 
         if self._backend is None:
             try:
-                from grilly import Compute
+                from grilly_next import Compute
 
                 self._backend = Compute()
             except Exception:

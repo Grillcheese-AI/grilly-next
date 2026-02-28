@@ -5,7 +5,7 @@ Replaces ImGui with a zero-dependency web UI that works on headless servers
 via SSH tunnel (ssh -L 8080:localhost:8080 user@a40-host).
 
 Usage:
-    from grilly.monitor import ReasoningMonitor
+    from grilly_next.monitor import ReasoningMonitor
 
     monitor = ReasoningMonitor(port=8080)
     monitor.start()
@@ -19,6 +19,6 @@ Usage:
     monitor.stop()
 """
 
-from grilly.monitor.server import ReasoningMonitor
+from grilly_next.monitor.server import ReasoningMonitor
 
 __all__ = ["ReasoningMonitor"]
