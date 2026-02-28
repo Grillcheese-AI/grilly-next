@@ -130,6 +130,10 @@ enum class OpType : uint8_t {
     // CubeMind — Temporal Foresight (counterfactual contradiction penalty)
     TemporalSurprise,
 
+    // VSA Hypernetwork
+    VSAUnpackProject,      // Fused bitunpack -> fp32 -> linear projection
+    VSASurrogateLoss,      // Hinge + contrastive margin loss on K branches
+
     _Count  // sentinel
 };
 
@@ -151,6 +155,28 @@ struct TemporalSurpriseParams {
 };
 static_assert(sizeof(TemporalSurpriseParams) <= 64,
               "TemporalSurpriseParams must fit in Node::params[64]");
+
+// ── VSASurrogateLossParams ──────────────────────────────────────────────
+//
+// Packed into Node::params[64] for VSASurrogateLoss nodes.
+// Stores hinge + contrastive margin loss configuration for K future
+// trajectory branches. Forward pass writes winning_k, runner_up_k, and
+// loss_value; backward pass reads them to route gradients.
+//
+// Memory: 36 bytes (fits comfortably in the 64-byte params buffer).
+//
+struct VSASurrogateLossParams {
+    float gamma;           // Hinge margin (default 0.1)
+    float delta_margin;    // Contrastive margin (default 0.5)
+    float lambda;          // Contrastive weight (default 0.1)
+    uint32_t K;            // Number of future trajectories
+    uint32_t D;            // VSA dimension (10240)
+    uint32_t winning_k;    // Written by forward, read by backward
+    uint32_t runner_up_k;  // Written by forward, read by backward
+    float loss_value;      // Written by forward
+};
+static_assert(sizeof(VSASurrogateLossParams) <= 64,
+              "Must fit in Node::params[64]");
 
 // ── Node ────────────────────────────────────────────────────────────────
 //
