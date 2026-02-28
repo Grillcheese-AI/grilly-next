@@ -63,7 +63,7 @@ Documentation = "https://grillcheeseai.com"
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages = ["src/grilly_next"]
-wheel.install-dir = "grilly_next"
+wheel.install-dir = "."
 
 [tool.scikit-build.cmake.define]
 # Vulkan SDK path — scikit-build passes this to CMake

@@ -181,5 +181,5 @@ endif()
 pybind11_add_module(grilly_core cpp/python/bindings.cpp)
 target_link_libraries(grilly_core PRIVATE grilly_core_lib)
 
-# Install the extension module into the grilly package
-install(TARGETS grilly_core DESTINATION grilly_next)
+# Install the extension module as a top-level module (import grilly_core)
+install(TARGETS grilly_core DESTINATION .)

@@ -39,6 +39,8 @@
 #include "grilly/temporal/vulkan_temporal.h"
 #include "grilly/temporal/hippocampus.h"
 #include "grilly/autograd/autograd.h"
+#include "grilly/autograd/vsa_loss_node.h"
+#include "grilly/models/vsa_hypernetwork.h"
 #include "grilly/system_profile.h"
 
 namespace py = pybind11;
@@ -2203,6 +2205,8 @@ PYBIND11_MODULE(grilly_core, m) {
         .value("MSELoss", grilly::autograd::OpType::MSELoss)
         .value("CubeMindSurprise", grilly::autograd::OpType::CubeMindSurprise)
         .value("TemporalSurprise", grilly::autograd::OpType::TemporalSurprise)
+        .value("VSAUnpackProject", grilly::autograd::OpType::VSAUnpackProject)
+        .value("VSASurrogateLoss", grilly::autograd::OpType::VSASurrogateLoss)
         .export_values();
 
     py::class_<grilly::autograd::TensorRef>(m, "TensorRef")
@@ -2363,6 +2367,98 @@ PYBIND11_MODULE(grilly_core, m) {
                  return node.outputs[idx];
              },
              py::arg("index"));
+
+    // ── VSA Hypernetwork ─────────────────────────────────────────────
+    py::class_<grilly::models::VSAHypernetwork>(m, "VSAHypernetwork")
+        .def(py::init(
+                 [](GrillyCoreContext& ctx,
+                    uint32_t d_model, uint32_t vsa_dim,
+                    uint32_t K, uint32_t seed) {
+                     return new grilly::models::VSAHypernetwork(
+                         ctx.pool, d_model, vsa_dim, K, seed);
+                 }),
+             py::arg("device"),
+             py::arg("d_model") = 768,
+             py::arg("vsa_dim") = 10240,
+             py::arg("K") = 4,
+             py::arg("seed") = 42,
+             py::keep_alive<1, 2>())
+        .def("forward",
+             [](grilly::models::VSAHypernetwork& self,
+                grilly::autograd::TapeContext& tape,
+                grilly::autograd::TensorRef vsa_state) {
+                 return self.forward(tape, vsa_state);
+             },
+             py::arg("tape"), py::arg("vsa_state"))
+        .def("parameter_buffer_ids",
+             &grilly::models::VSAHypernetwork::parameter_buffer_ids)
+        .def_property_readonly("d_model",
+             &grilly::models::VSAHypernetwork::d_model)
+        .def_property_readonly("vsa_dim",
+             &grilly::models::VSAHypernetwork::vsa_dim)
+        .def_property_readonly("K",
+             &grilly::models::VSAHypernetwork::K);
+
+    m.def("vsa_training_step",
+          [](GrillyCoreContext& ctx,
+             grilly::autograd::TapeContext& tape,
+             grilly::models::VSAHypernetwork& model,
+             py::array_t<uint32_t> vsa_state_np,
+             py::array_t<uint32_t> true_delta_np) -> float {
+              // Upload VSA state
+              auto state_buf = vsa_state_np.request();
+              auto* state_data = static_cast<uint32_t*>(state_buf.ptr);
+              uint32_t num_words = static_cast<uint32_t>(state_buf.shape[0]);
+
+              auto state_ref = grilly::autograd::upload_bitpacked(
+                  ctx.pool, state_data, num_words, model.vsa_dim());
+
+              tape.begin();
+
+              // Forward
+              auto predicted = model.forward(tape, state_ref);
+
+              // Upload true delta
+              auto delta_buf = true_delta_np.request();
+              auto* delta_data = static_cast<uint32_t*>(delta_buf.ptr);
+              auto delta_ref = grilly::autograd::upload_bitpacked(
+                  ctx.pool, delta_data, num_words, model.vsa_dim());
+
+              // Record loss
+              grilly::autograd::VSASurrogateLossParams loss_params{};
+              loss_params.gamma = 0.1f;
+              loss_params.delta_margin = 0.5f;
+              loss_params.lambda = 0.1f;
+              loss_params.K = model.K();
+              loss_params.D = model.vsa_dim();
+
+              grilly::autograd::TensorRef loss_output{};
+              loss_output.ndim = 1;
+              loss_output.shape[0] = 1;
+              loss_output.dtype = 0;
+              loss_output.requires_grad = false;
+
+              grilly::autograd::TensorRef loss_inputs[] = {predicted, delta_ref};
+              grilly::autograd::TensorRef loss_outputs[] = {loss_output};
+              auto* loss_node = tape.record_op(
+                  grilly::autograd::OpType::VSASurrogateLoss,
+                  loss_inputs, 2, loss_outputs, 1,
+                  &loss_params, sizeof(loss_params));
+
+              // Forward loss
+              float loss = grilly::autograd::dispatch_vsa_loss_forward(
+                  ctx.pool, ctx.batch, ctx.cache, loss_node);
+
+              // Backward
+              tape.backward(loss_node, 0);
+
+              tape.end();
+
+              return loss;
+          },
+          py::arg("device"), py::arg("tape"),
+          py::arg("model"), py::arg("vsa_state"), py::arg("true_delta"),
+          "Run one VSA training step: forward + loss + backward. Returns loss value.");
 
     // ── Temporal: TemporalEncoder + CounterfactualReasoner ────────────────
 
