@@ -150,6 +150,7 @@ add_library(grilly_core_lib STATIC
     cpp/src/cognitive/world_model.cpp
     cpp/src/temporal/vulkan_temporal.cpp
     cpp/src/autograd.cpp
+    cpp/src/autograd/vsa_loss_node.cpp
 )
 
 target_include_directories(grilly_core_lib PUBLIC
@@ -180,4 +181,4 @@ pybind11_add_module(grilly_core cpp/python/bindings.cpp)
 target_link_libraries(grilly_core PRIVATE grilly_core_lib)
 
 # Install the extension module into the grilly package
-install(TARGETS grilly_core DESTINATION grilly)
+install(TARGETS grilly_core DESTINATION grilly_next)
