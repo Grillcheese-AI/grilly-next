@@ -324,6 +324,10 @@ private:
     void backward_sum(Node* node);
     void backward_mean(Node* node);
 
+    // VSA Hypernetwork backward handlers
+    void backward_vsa_surrogate_loss(Node* node);
+    void backward_vsa_unpack_project(Node* node);
+
     BufferPool& pool_;
     CommandBatch& batch_;
     PipelineCache& cache_;

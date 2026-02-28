@@ -151,6 +151,7 @@ add_library(grilly_core_lib STATIC
     cpp/src/temporal/vulkan_temporal.cpp
     cpp/src/autograd.cpp
     cpp/src/autograd/vsa_loss_node.cpp
+    cpp/src/models/vsa_hypernetwork.cpp
 )
 
 target_include_directories(grilly_core_lib PUBLIC

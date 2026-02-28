@@ -1,4 +1,5 @@
 #include "grilly/autograd/autograd.h"
+#include "grilly/autograd/vsa_loss_node.h"
 
 #include <algorithm>
 #include <cmath>
@@ -115,6 +116,8 @@ void BackwardEngine::dispatch_node_backward(Node* node) {
         case OpType::Transpose: backward_transpose(node); break;
         case OpType::Sum:       backward_sum(node); break;
         case OpType::Mean:      backward_mean(node); break;
+        case OpType::VSASurrogateLoss: backward_vsa_surrogate_loss(node); break;
+        case OpType::VSAUnpackProject: backward_vsa_unpack_project(node); break;
 
         // Ops with no backward (or not yet implemented)
         default:
@@ -520,6 +523,16 @@ void BackwardEngine::backward_mean(Node* node) {
         node->grad_input_buffers[0] = 1;
         stats_.shaders_dispatched++;
     }
+}
+
+void BackwardEngine::backward_vsa_surrogate_loss(Node* node) {
+    dispatch_vsa_loss_backward(pool_, batch_, cache_, node, 1.0f);
+    stats_.shaders_dispatched++;
+}
+
+void BackwardEngine::backward_vsa_unpack_project(Node* node) {
+    dispatch_vsa_unpack_project_backward(pool_, batch_, cache_, node);
+    stats_.shaders_dispatched++;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
