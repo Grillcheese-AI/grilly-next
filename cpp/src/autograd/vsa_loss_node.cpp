@@ -141,12 +141,38 @@ void dispatch_vsa_unpack_project_forward(BufferPool& pool,
                                          Node* node) {
     uint32_t output_dim = node->outputs[0].shape[1];
     uint32_t batch_size = node->outputs[0].shape[0];
+    uint32_t vsa_dim = node->inputs[0].shape[0] * 32;  // bitpacked
+    uint32_t num_words = node->inputs[0].shape[0];
 
-    // TODO: dispatch vsa-unpack-project shader
-    // Bind: vsa_data(0), W(1), b(2), output(3)
-    // Push constants: {batch_size, vsa_dim, output_dim, num_words}
-    // Dispatch: (output_dim, batch_size, 1) workgroups
-    // batch.submit(); batch.waitIdle();
+    // Buffers: vsa_data(0), W(1), b(2), output(3)
+    GrillyBuffer bufVSA    = {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->inputs[0].buffer_id))};
+    GrillyBuffer bufW      = {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->saved_buffer_ids[0]))};
+    GrillyBuffer bufB      = {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->saved_buffer_ids[1]))};
+    GrillyBuffer bufOutput = {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->outputs[0].buffer_id))};
+
+    size_t vsaBytes    = num_words * sizeof(uint32_t);
+    size_t wBytes      = size_t(output_dim) * vsa_dim * sizeof(float);
+    size_t bBytes      = output_dim * sizeof(float);
+    size_t outputBytes = size_t(batch_size) * output_dim * sizeof(float);
+
+    PipelineEntry pipe = cache.getOrCreate("vsa-unpack-project", 4, 16);
+
+    std::vector<VkDescriptorBufferInfo> bufInfos = {
+        {bufVSA.handle,    0, vsaBytes},
+        {bufW.handle,      0, wBytes},
+        {bufB.handle,      0, bBytes},
+        {bufOutput.handle, 0, outputBytes},
+    };
+
+    VkDescriptorSet descSet = cache.allocDescriptorSet("vsa-unpack-project", bufInfos);
+
+    struct { uint32_t batch_size, vsa_dim, output_dim, num_words; } pushData =
+        {batch_size, vsa_dim, output_dim, num_words};
+
+    batch.begin();
+    batch.dispatch(pipe.pipeline, pipe.layout, descSet, output_dim, batch_size, 1,
+                   &pushData, sizeof(pushData));
+    batch.submit();
 }
 
 void dispatch_vsa_unpack_project_backward(BufferPool& pool,
