@@ -32,7 +32,7 @@ namespace autograd {
 //
 // GPU data lifecycle:
 //   Tensor weights, activations, and gradients live in BufferPool (VRAM).
-//   Nodes hold uint32_t buffer_ids — lightweight handles. When the arena
+//   Nodes hold uint64_t buffer_ids — lightweight handles. When the arena
 //   resets, the graph metadata vanishes but VRAM data is untouched.
 //   BufferPool manages VRAM allocation/deallocation independently.
 
@@ -43,7 +43,7 @@ namespace autograd {
 // practical neural network shapes.
 
 struct TensorRef {
-    uint32_t buffer_id;      // Index into BufferPool (0 = invalid/none)
+    uint64_t buffer_id;      // VkBuffer handle (0 = invalid/none)
     uint32_t ndim;           // Number of dimensions (max 8)
     uint32_t shape[8];       // Shape (e.g., {batch, seq_len, hidden_dim})
     uint32_t dtype;          // 0=f32, 1=f16, 2=u32, 3=i32
@@ -62,13 +62,13 @@ struct TensorRef {
 
     static TensorRef none() {
         TensorRef ref{};
-        ref.buffer_id = 0;
+        ref.buffer_id = 0ULL;
         ref.ndim = 0;
         ref.requires_grad = false;
         return ref;
     }
 
-    bool valid() const { return buffer_id != 0; }
+    bool valid() const { return buffer_id != 0ULL; }
 };
 
 // ── OpType ──────────────────────────────────────────────────────────────
@@ -207,14 +207,14 @@ struct Node {
     // Buffer IDs for tensors needed during backward but not graph edges.
     // E.g., the weight matrix in Linear, the pre-activation values in ReLU.
     uint32_t num_saved;
-    uint32_t saved_buffer_ids[kMaxNodeIO];
+    uint64_t saved_buffer_ids[kMaxNodeIO];
 
     // ── Gradient buffer IDs ──
     // Filled during backward(). grad_output_buffer holds dL/d(output).
     // grad_input_buffers[] are allocated by the backward engine and hold
     // dL/d(input_i) after this node's backward shader runs.
-    uint32_t grad_output_buffer;     // Gradient flowing in from downstream
-    uint32_t grad_input_buffers[kMaxNodeIO];  // Gradients flowing to inputs
+    uint64_t grad_output_buffer;     // Gradient flowing in from downstream
+    uint64_t grad_input_buffers[kMaxNodeIO];  // Gradients flowing to inputs
 
     // ── Per-op scalar parameters ──
     // Inline push-constant data for the backward shader.
@@ -267,12 +267,12 @@ public:
     ///
     /// After this call, each leaf input's gradient can be read from the
     /// buffer ID stored in the node's grad_input_buffers[].
-    void backward(TapeArena& tape, Node* loss_node, uint32_t grad_output_buffer);
+    void backward(TapeArena& tape, Node* loss_node, uint64_t grad_output_buffer);
 
     /// Get the gradient buffer ID for a given input buffer.
     /// Searches the grad accumulation map populated during backward().
     /// Returns 0 if no gradient was computed for this buffer.
-    uint32_t get_grad_buffer(uint32_t input_buffer_id) const;
+    uint64_t get_grad_buffer(uint64_t input_buffer_id) const;
 
     /// Clear gradient accumulation state (call between training steps).
     void clear_grads();
@@ -294,7 +294,7 @@ private:
     /// This handles fan-out: when tensor A feeds into ops B and C,
     /// both contribute gradients that get summed into A's grad buffer.
     void accumulate_grad(Node* target_node, uint32_t input_idx,
-                         uint32_t grad_buffer);
+                         uint64_t grad_buffer);
 
     /// Shader dispatch helpers for specific op types
     void backward_linear(Node* node);
@@ -338,18 +338,18 @@ private:
     // Max 4096 unique tensors per forward pass is generous.
     static constexpr size_t kMaxGradEntries = 4096;
     struct GradEntry {
-        uint32_t buffer_id;       // The input tensor's buffer ID
-        uint32_t grad_buffer_id;  // The accumulated gradient buffer ID
+        uint64_t buffer_id;       // The input tensor's buffer ID
+        uint64_t grad_buffer_id;  // The accumulated gradient buffer ID
     };
     GradEntry grad_table_[kMaxGradEntries];
     uint32_t grad_count_ = 0;
 
     // Overflow slot — returned when grad_table_ is full (should never happen).
     // Member variable avoids returning address of local/temporary.
-    uint32_t overflow_slot_ = 0;
+    uint64_t overflow_slot_ = 0;
 
     /// Find or insert a grad entry. Returns the grad_buffer_id slot.
-    uint32_t& find_or_insert_grad(uint32_t buffer_id);
+    uint64_t& find_or_insert_grad(uint64_t buffer_id);
 };
 
 // ── TapeContext ─────────────────────────────────────────────────────────
@@ -372,13 +372,13 @@ public:
                     const void* params = nullptr, uint32_t params_size = 0);
 
     /// Save buffer IDs needed for backward (weight, activation cache, etc.)
-    void save_for_backward(Node* node, const uint32_t* buffer_ids, uint32_t count);
+    void save_for_backward(Node* node, const uint64_t* buffer_ids, uint32_t count);
 
     /// Run backward from the loss node.
-    void backward(Node* loss_node, uint32_t grad_output_buffer);
+    void backward(Node* loss_node, uint64_t grad_output_buffer);
 
     /// Get gradient buffer for a specific input.
-    uint32_t get_grad_buffer(uint32_t input_buffer_id) const;
+    uint64_t get_grad_buffer(uint64_t input_buffer_id) const;
 
     /// End the tape: reset arena, clear gradients.
     void end();

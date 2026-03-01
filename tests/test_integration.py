@@ -167,15 +167,17 @@ class TestVSAPipeline:
         """Test VSA encode returns correct shape and dtype"""
         dim = 10240
         roles = ["subject", "verb"]
-        filler1 = np.array(list(b"cat"), dtype=np.int8)
-        filler2 = np.array(list(b"sat"), dtype=np.int8)
+        # Fillers must be bipolar {-1, +1} vectors of length dim
+        rng = np.random.RandomState(42)
+        filler1 = rng.choice([-1, 1], size=dim).astype(np.int8)
+        filler2 = rng.choice([-1, 1], size=dim).astype(np.int8)
         encoded = grilly_core.vsa_encode(roles, [filler1, filler2], dim)
         assert encoded.dtype == np.uint32
         words = (dim + 31) // 32
         assert encoded.shape == (words,)
 
         # Different fillers should produce different encodings
-        filler3 = np.array(list(b"dog"), dtype=np.int8)
+        filler3 = rng.choice([-1, 1], size=dim).astype(np.int8)
         encoded2 = grilly_core.vsa_encode(roles, [filler1, filler3], dim)
         assert not np.array_equal(encoded, encoded2)
 

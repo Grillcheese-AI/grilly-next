@@ -116,6 +116,12 @@ public:
     cubemind::VSACache& facts_cache() { return known_facts_; }
     cubemind::VSACache& constraints_cache() { return constraints_; }
 
+    /// Get the GPU buffer containing constraint vectors (synced from host).
+    /// Used by many-worlds coherence shader to bind constraints directly.
+    GrillyBuffer& constraints_gpu_buffer() {
+        return constraints_.gpuBuffer();
+    }
+
     uint32_t dim() const { return config_.dim; }
 
 private:

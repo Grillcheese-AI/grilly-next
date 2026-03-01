@@ -152,6 +152,7 @@ add_library(grilly_core_lib STATIC
     cpp/src/autograd.cpp
     cpp/src/autograd/vsa_loss_node.cpp
     cpp/src/models/vsa_hypernetwork.cpp
+    cpp/src/generation/many_worlds.cpp
 )
 
 target_include_directories(grilly_core_lib PUBLIC

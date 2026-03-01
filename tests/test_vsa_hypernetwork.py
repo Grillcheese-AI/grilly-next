@@ -4,6 +4,8 @@ Tests for VSA Hypernetwork + Surrogate Loss.
 Tests the full pipeline: bitpacked VSA state -> unpack+project -> MLP -> loss.
 """
 
+import pathlib
+
 import numpy as np
 import pytest
 
@@ -18,6 +20,8 @@ try:
     from grilly_next.backend import VULKAN_AVAILABLE
 except ImportError:
     VULKAN_AVAILABLE = False
+
+_SHADER_DIR = str(pathlib.Path(__file__).parent.parent / "shaders" / "spv")
 
 
 @pytest.mark.gpu
@@ -70,6 +74,7 @@ class TestVSATrainingStep:
     @pytest.fixture
     def device(self):
         dev = grilly_core.Device()
+        dev.load_shaders(_SHADER_DIR)
         yield dev
 
     @pytest.fixture
@@ -95,7 +100,7 @@ class TestVSATrainingStep:
         assert np.isfinite(loss), f"Loss is not finite: {loss}"
         assert loss >= 0.0, f"Loss should be non-negative: {loss}"
 
-    @pytest.mark.xfail(reason="VSA loss node forward is scaffold — GPU dispatch not fully wired")
+    @pytest.mark.xfail(reason="Linear/GELU backward handlers are scaffolded — weight gradients not yet propagated")
     def test_training_loss_decreases(self, device, tape):
         """Test that loss decreases over multiple training steps."""
         model = grilly_core.VSAHypernetwork(

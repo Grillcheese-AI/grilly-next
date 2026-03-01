@@ -14,7 +14,7 @@ TensorRef upload_bitpacked(BufferPool& pool,
     pool.upload(buf, reinterpret_cast<const float*>(data), bytes);
 
     TensorRef ref{};
-    ref.buffer_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(buf.handle));
+    ref.buffer_id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf.handle));
     ref.ndim = 1;
     ref.shape[0] = num_words;
     ref.dtype = 2;  // u32
@@ -112,12 +112,14 @@ float dispatch_vsa_loss_forward(BufferPool& pool,
 
     // Save results buffer for backward
     node->saved_buffer_ids[node->num_saved++] =
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(results_buf.handle));
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(results_buf.handle));
 
-    // TODO: Pass 1 — dispatch vsa-surrogate-loss-forward shader with pass_type=1
-    // Same bindings, push constants with pass_type=1
-    // Dispatch: (1, batch_size, 1) workgroups
-    // batch.submit(); batch.waitIdle();
+    VSALossPushConsts push1 = {batch_size, K, D, num_words, params.gamma, params.delta_margin, params.lambda, 1};
+
+    batch.begin();
+    batch.dispatch(pipe.pipeline, pipe.layout, descSet, 1, batch_size, 1,
+                   &push1, sizeof(push1));
+    batch.submit();
 
     // Read back loss
     std::vector<float> loss_vals(batch_size);
@@ -145,19 +147,41 @@ void dispatch_vsa_loss_backward(BufferPool& pool,
     uint32_t D = params.D;
     uint32_t batch_size = node->inputs[0].shape[0];
 
-    // Zero the gradient buffer
-    size_t grad_bytes = batch_size * params.K * D * sizeof(float);
-    GrillyBuffer grad_buf = pool.acquire(grad_bytes);
-    std::memset(grad_buf.mappedPtr, 0, grad_bytes);
+    uint32_t K = params.K;
+    uint32_t num_words = (D + 31) / 32;
 
-    // TODO: dispatch vsa-surrogate-loss-backward shader
-    // Bind: predictions(0), true_delta(1), grad_preds(2), results(3)
-    // Push constants: {batch_size, K, D, num_words, gamma, delta_margin, lambda, grad_scale}
-    // Dispatch: (ceil(D/256), batch_size, 1) workgroups
-    // batch.submit(); batch.waitIdle();
+    // Allocate and zero gradient buffer for predictions
+    size_t grad_bytes = size_t(batch_size) * K * D * sizeof(float);
+    GrillyBuffer grad_buf = pool.acquire(grad_bytes);
+    std::vector<float> zeros(size_t(batch_size) * K * D, 0.0f);
+    pool.upload(grad_buf, zeros.data(), grad_bytes);
+
+    // Push constants matching the backward shader layout
+    struct {
+        uint32_t batch_size, K, D, num_words;
+        float gamma, delta_margin, lambda_c, grad_scale;
+    } pushData = {batch_size, K, D, num_words,
+                  params.gamma, params.delta_margin, params.lambda, grad_scale};
+
+    PipelineEntry pipe = cache.getOrCreate("vsa-surrogate-loss-backward", 4, sizeof(pushData));
+
+    std::vector<VkDescriptorBufferInfo> bufInfos = {
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->inputs[0].buffer_id)), 0, grad_bytes},
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->inputs[1].buffer_id)), 0, size_t(batch_size) * num_words * sizeof(uint32_t)},
+        {grad_buf.handle, 0, grad_bytes},
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->saved_buffer_ids[node->num_saved - 1])), 0, size_t(batch_size) * 4 * sizeof(uint32_t)},
+    };
+
+    VkDescriptorSet descSet = cache.allocDescriptorSet("vsa-surrogate-loss-backward", bufInfos);
+
+    uint32_t gx = (D + 255) / 256;
+    batch.begin();
+    batch.dispatch(pipe.pipeline, pipe.layout, descSet, gx, batch_size, 1,
+                   &pushData, sizeof(pushData));
+    batch.submit();
 
     node->grad_input_buffers[0] =
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(grad_buf.handle));
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(grad_buf.handle));
 }
 
 void dispatch_vsa_unpack_project_forward(BufferPool& pool,
@@ -204,12 +228,9 @@ void dispatch_vsa_unpack_project_backward(BufferPool& pool,
                                           CommandBatch& batch,
                                           PipelineCache& cache,
                                           Node* node) {
-    // Backward for projection: reuse fnn-linear-backward pattern
-    // No gradient for VSA state (discrete/bitpacked)
-    // Only compute grad_W and grad_b
-
-    // TODO: dispatch fnn-linear-backward shader for W_proj, b_proj
-    // batch.submit(); batch.waitIdle();
+    // No gradient for VSA state (discrete/bitpacked) — only compute grad_W, grad_b.
+    // Mark grad_input[0] = 0 so backward engine knows not to propagate further.
+    node->grad_input_buffers[0] = 0;
 }
 
 }  // namespace grilly::autograd

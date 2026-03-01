@@ -64,3 +64,6 @@ archive/
 .claude/settings.local.json
 ARTICLE.md
 IEEE_PAPER.md
+runpodinfo.txt
+VSA_TODO.md
+docs/paper.md

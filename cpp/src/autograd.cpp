@@ -19,7 +19,7 @@ BackwardEngine::BackwardEngine(BufferPool& pool, CommandBatch& batch,
 }
 
 void BackwardEngine::backward(TapeArena& tape, Node* loss_node,
-                               uint32_t grad_output_buffer) {
+                               uint64_t grad_output_buffer) {
     stats_ = {};
 
     // 1. Seed the loss node's gradient: dL/d(loss) flows in from outside
@@ -50,8 +50,8 @@ void BackwardEngine::backward(TapeArena& tape, Node* loss_node,
                 if (!current->inputs[i].requires_grad) continue;
                 if (current->grad_input_buffers[i] == 0) continue;
 
-                uint32_t input_buf = current->inputs[i].buffer_id;
-                uint32_t& accum = find_or_insert_grad(input_buf);
+                uint64_t input_buf = current->inputs[i].buffer_id;
+                uint64_t& accum = find_or_insert_grad(input_buf);
 
                 if (accum == 0) {
                     // First gradient contribution — just store it
@@ -126,13 +126,13 @@ void BackwardEngine::dispatch_node_backward(Node* node) {
     }
 }
 
-uint32_t BackwardEngine::get_grad_buffer(uint32_t input_buffer_id) const {
+uint64_t BackwardEngine::get_grad_buffer(uint64_t input_buffer_id) const {
     for (uint32_t i = 0; i < grad_count_; ++i) {
         if (grad_table_[i].buffer_id == input_buffer_id) {
             return grad_table_[i].grad_buffer_id;
         }
     }
-    return 0;
+    return 0ULL;
 }
 
 void BackwardEngine::clear_grads() {
@@ -140,7 +140,7 @@ void BackwardEngine::clear_grads() {
     std::memset(grad_table_, 0, sizeof(grad_table_));
 }
 
-uint32_t& BackwardEngine::find_or_insert_grad(uint32_t buffer_id) {
+uint64_t& BackwardEngine::find_or_insert_grad(uint64_t buffer_id) {
     // Linear scan — fine for <4096 entries. The grad_table_ is in L1 cache
     // because it's a contiguous array on the BackwardEngine (stack/heap).
     for (uint32_t i = 0; i < grad_count_; ++i) {
@@ -160,7 +160,7 @@ uint32_t& BackwardEngine::find_or_insert_grad(uint32_t buffer_id) {
 }
 
 void BackwardEngine::accumulate_grad(Node* target_node, uint32_t input_idx,
-                                      uint32_t grad_buffer) {
+                                      uint64_t grad_buffer) {
     // Store the gradient buffer in the target node's grad_input_buffers
     if (input_idx < kMaxNodeIO) {
         target_node->grad_input_buffers[input_idx] = grad_buffer;
@@ -590,7 +590,7 @@ Node* TapeContext::record_op(OpType op,
     return node;
 }
 
-void TapeContext::save_for_backward(Node* node, const uint32_t* buffer_ids,
+void TapeContext::save_for_backward(Node* node, const uint64_t* buffer_ids,
                                      uint32_t count) {
     if (!node) return;
     for (uint32_t i = 0; i < count && i < kMaxNodeIO; ++i) {
@@ -599,12 +599,12 @@ void TapeContext::save_for_backward(Node* node, const uint32_t* buffer_ids,
     node->num_saved = std::min(count, static_cast<uint32_t>(kMaxNodeIO));
 }
 
-void TapeContext::backward(Node* loss_node, uint32_t grad_output_buffer) {
+void TapeContext::backward(Node* loss_node, uint64_t grad_output_buffer) {
     recording_ = false;
     engine_.backward(arena_, loss_node, grad_output_buffer);
 }
 
-uint32_t TapeContext::get_grad_buffer(uint32_t input_buffer_id) const {
+uint64_t TapeContext::get_grad_buffer(uint64_t input_buffer_id) const {
     return engine_.get_grad_buffer(input_buffer_id);
 }
 

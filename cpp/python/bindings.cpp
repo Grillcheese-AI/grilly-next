@@ -41,6 +41,7 @@
 #include "grilly/autograd/autograd.h"
 #include "grilly/autograd/vsa_loss_node.h"
 #include "grilly/models/vsa_hypernetwork.h"
+#include "grilly/generation/many_worlds.h"
 #include "grilly/system_profile.h"
 
 namespace py = pybind11;
@@ -982,8 +983,16 @@ PYBIND11_MODULE(grilly_core, m) {
 
             std::vector<const int8_t*> fillerPtrs;
             fillerPtrs.reserve(fillers.size());
-            for (auto& f : fillers)
-                fillerPtrs.push_back(static_cast<const int8_t*>(f.request().ptr));
+            for (size_t i = 0; i < fillers.size(); ++i) {
+                auto buf = fillers[i].request();
+                if (static_cast<uint32_t>(buf.size) < dim)
+                    throw std::runtime_error(
+                        "VSA encode: filler[" + std::to_string(i) +
+                        "] has " + std::to_string(buf.size) +
+                        " elements but dim=" + std::to_string(dim) +
+                        ". Fillers must be bipolar {-1,+1} vectors of length dim.");
+                fillerPtrs.push_back(static_cast<const int8_t*>(buf.ptr));
+            }
 
             auto packed = grilly::cubemind::vsaEncode(roles, fillerPtrs, dim);
 
@@ -2104,6 +2113,78 @@ PYBIND11_MODULE(grilly_core, m) {
         .def_property_readonly("dim",
              &grilly::cognitive::WorldModel::dim);
 
+    // ── Many-Worlds Inference (Batch Counterfactual Coherence) ──────────
+
+    py::class_<grilly::generation::ManyWorldsResult>(m, "ManyWorldsResult")
+        .def_readonly("violation_counts",
+                      &grilly::generation::ManyWorldsResult::violation_counts)
+        .def_readonly("best_k",
+                      &grilly::generation::ManyWorldsResult::best_k)
+        .def_readonly("K",
+                      &grilly::generation::ManyWorldsResult::K)
+        .def_readonly("words_per_vec",
+                      &grilly::generation::ManyWorldsResult::words_per_vec)
+        .def("future_states_array",
+             [](const grilly::generation::ManyWorldsResult& r)
+                 -> py::array_t<uint32_t> {
+                 py::array_t<uint32_t> arr({r.K, r.words_per_vec});
+                 std::memcpy(arr.mutable_data(), r.future_states.data(),
+                             r.future_states.size() * sizeof(uint32_t));
+                 return arr;
+             },
+             "Get future states as numpy array [K, words_per_vec]")
+        .def("coherence_scores",
+             [](const grilly::generation::ManyWorldsResult& r)
+                 -> py::array_t<float> {
+                 py::array_t<float> arr(r.K);
+                 auto mut = arr.mutable_unchecked<1>();
+                 for (uint32_t k = 0; k < r.K; ++k)
+                     mut(k) = static_cast<float>(r.violation_counts[k]);
+                 return arr;
+             },
+             "Get violation counts as float numpy array [K]");
+
+    m.def("evaluate_many_worlds",
+          [](GrillyCoreContext& ctx,
+             py::array_t<uint32_t> current_state,
+             py::array_t<float> continuous_deltas,
+             grilly::cognitive::WorldModel& world_model) {
+              auto buf_state = current_state.request();
+              auto buf_deltas = continuous_deltas.request();
+
+              if (buf_deltas.ndim < 2)
+                  throw std::runtime_error(
+                      "continuous_deltas must be at least 2D [K, D]");
+
+              uint32_t K, D;
+              if (buf_deltas.ndim == 3) {
+                  // [batch=1, K, D]
+                  K = static_cast<uint32_t>(buf_deltas.shape[1]);
+                  D = static_cast<uint32_t>(buf_deltas.shape[2]);
+              } else {
+                  // [K, D]
+                  K = static_cast<uint32_t>(buf_deltas.shape[0]);
+                  D = static_cast<uint32_t>(buf_deltas.shape[1]);
+              }
+
+              return grilly::generation::evaluate_many_worlds(
+                  ctx.batch, ctx.pool, ctx.cache,
+                  static_cast<uint32_t*>(buf_state.ptr),
+                  static_cast<float*>(buf_deltas.ptr),
+                  K, D, world_model);
+          },
+          py::arg("device"),
+          py::arg("current_state"),
+          py::arg("continuous_deltas"),
+          py::arg("world_model"),
+          "Evaluate K counterfactual futures against WorldModel constraints.\n\n"
+          "Args:\n"
+          "    device: GrillyCoreContext (Device)\n"
+          "    current_state: Bitpacked current state [words_per_vec] uint32\n"
+          "    continuous_deltas: Float predictions [K, D] or [1, K, D]\n"
+          "    world_model: WorldModel with loaded constraints\n\n"
+          "Returns: ManyWorldsResult with violation counts and future states");
+
     // ── Hippocampal Consolidator (Offline Dream Cycle) ──────────────────
 
     py::class_<grilly::DreamReport>(m, "DreamReport")
@@ -2262,7 +2343,7 @@ PYBIND11_MODULE(grilly_core, m) {
         .def("save_for_backward",
              [](grilly::autograd::TapeContext& tape,
                 grilly::autograd::Node* node,
-                const std::vector<uint32_t>& buffer_ids) {
+                const std::vector<uint64_t>& buffer_ids) {
                  tape.save_for_backward(
                      node, buffer_ids.data(),
                      static_cast<uint32_t>(buffer_ids.size()));
@@ -2271,7 +2352,7 @@ PYBIND11_MODULE(grilly_core, m) {
         .def("backward",
              [](grilly::autograd::TapeContext& tape,
                 grilly::autograd::Node* loss_node,
-                uint32_t grad_output_buffer) {
+                uint64_t grad_output_buffer) {
                  tape.backward(loss_node, grad_output_buffer);
              },
              py::arg("loss_node"), py::arg("grad_output_buffer"))
@@ -2375,7 +2456,8 @@ PYBIND11_MODULE(grilly_core, m) {
                     uint32_t d_model, uint32_t vsa_dim,
                     uint32_t K, uint32_t seed) {
                      return new grilly::models::VSAHypernetwork(
-                         ctx.pool, d_model, vsa_dim, K, seed);
+                         ctx.pool, ctx.batch, ctx.cache,
+                         d_model, vsa_dim, K, seed);
                  }),
              py::arg("device"),
              py::arg("d_model") = 768,
@@ -2392,12 +2474,50 @@ PYBIND11_MODULE(grilly_core, m) {
              py::arg("tape"), py::arg("vsa_state"))
         .def("parameter_buffer_ids",
              &grilly::models::VSAHypernetwork::parameter_buffer_ids)
+        .def("last_output_buffer_id",
+             [](grilly::models::VSAHypernetwork& self) -> uint64_t {
+                 return self.last_output().buffer_id;
+             })
         .def_property_readonly("d_model",
              &grilly::models::VSAHypernetwork::d_model)
         .def_property_readonly("vsa_dim",
              &grilly::models::VSAHypernetwork::vsa_dim)
         .def_property_readonly("K",
-             &grilly::models::VSAHypernetwork::K);
+             &grilly::models::VSAHypernetwork::K)
+        .def("forward_inference",
+             [](grilly::models::VSAHypernetwork& self,
+                GrillyCoreContext& ctx,
+                grilly::autograd::TapeContext& tape,
+                py::array_t<uint32_t> vsa_state_np)
+                 -> py::array_t<float> {
+                 // Upload bitpacked state
+                 auto buf = vsa_state_np.request();
+                 auto* data = static_cast<uint32_t*>(buf.ptr);
+                 uint32_t num_words = static_cast<uint32_t>(buf.shape[0]);
+
+                 auto state_ref = grilly::autograd::upload_bitpacked(
+                     ctx.pool, data, num_words, self.vsa_dim());
+
+                 tape.begin();
+                 self.forward(tape, state_ref);
+
+                 // Readback K * vsa_dim floats from the mapped output buffer
+                 auto vec = self.readback_output();
+                 uint32_t K = self.K();
+                 uint32_t D = self.vsa_dim();
+                 py::array_t<float> arr({K, D});
+                 std::memcpy(arr.mutable_data(), vec.data(),
+                             vec.size() * sizeof(float));
+                 return arr;
+             },
+             py::arg("device"), py::arg("tape"), py::arg("vsa_state"),
+             "Inference forward pass: upload bitpacked state, run hypernetwork,\n"
+             "readback K x vsa_dim float32 continuous deltas.\n\n"
+             "Args:\n"
+             "    device: GrillyCoreContext (Device)\n"
+             "    tape: TapeContext (for recording ops)\n"
+             "    vsa_state: Bitpacked uint32 state [words_per_vec]\n\n"
+             "Returns: numpy float32 array [K, vsa_dim]");
 
     m.def("vsa_training_step",
           [](GrillyCoreContext& ctx,
@@ -2450,8 +2570,7 @@ PYBIND11_MODULE(grilly_core, m) {
                   ctx.pool, ctx.batch, ctx.cache, loss_node);
 
               // Backward
-              tape.backward(loss_node, 0);
-
+              tape.backward(loss_node, 0ULL);
               tape.end();
 
               return loss;

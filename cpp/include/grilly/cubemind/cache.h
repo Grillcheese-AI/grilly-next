@@ -94,6 +94,13 @@ public:
     /// Direct access to contiguous key data (for GPU upload in benchmarks).
     const uint32_t* keyData() const { return keys_.data(); }
 
+    /// Sync host keys to GPU and return the GPU buffer handle.
+    /// Used by many-worlds coherence check to bind constraints directly.
+    GrillyBuffer& gpuBuffer() {
+        ensureGPUSync();
+        return gpuKeys_;
+    }
+
 private:
     BufferPool& pool_;
     CacheConfig config_;
