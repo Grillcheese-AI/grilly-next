@@ -44,11 +44,36 @@ float dispatch_vsa_loss_forward(BufferPool& pool,
     size_t loss_bytes = batch_size * sizeof(float);
     GrillyBuffer loss_buf = pool.acquire(loss_bytes);
 
-    // TODO: Pass 0 — dispatch vsa-surrogate-loss-forward shader with pass_type=0
-    // Bind: predictions(0), true_delta(1), dots(2), loss(3), results(4)
-    // Push constants: {batch_size, K, D, num_words, gamma, delta_margin, lambda, 0}
-    // Dispatch: (K, batch_size, 1) workgroups of (256, 1, 1)
-    // batch.submit(); batch.waitIdle();
+    // Push constants struct matching GLSL layout
+    struct VSALossPushConsts {
+        uint32_t batch_size;
+        uint32_t K;
+        uint32_t D;
+        uint32_t num_words;
+        float gamma;
+        float delta_margin;
+        float lambda_c;
+        uint32_t pass_type;
+    };
+
+    PipelineEntry pipe = cache.getOrCreate("vsa-surrogate-loss-forward", 5, sizeof(VSALossPushConsts));
+
+    std::vector<VkDescriptorBufferInfo> bufInfos = {
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->inputs[0].buffer_id)), 0, size_t(batch_size) * K * D * sizeof(float)},
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->inputs[1].buffer_id)), 0, size_t(batch_size) * num_words * sizeof(uint32_t)},
+        {dots_buf.handle, 0, dots_bytes},
+        {loss_buf.handle, 0, loss_bytes},
+        {results_buf.handle, 0, results_bytes},
+    };
+
+    VkDescriptorSet descSet = cache.allocDescriptorSet("vsa-surrogate-loss-forward", bufInfos);
+
+    VSALossPushConsts push0 = {batch_size, K, D, num_words, params.gamma, params.delta_margin, params.lambda, 0};
+
+    batch.begin();
+    batch.dispatch(pipe.pipeline, pipe.layout, descSet, K, batch_size, 1,
+                   &push0, sizeof(push0));
+    batch.submit();
 
     // CPU argmax: find winning_k and runner_up_k per batch
     std::vector<float> dots(batch_size * K);
