@@ -59,6 +59,17 @@ void main() {
     float g = grad[idx];
     float r = recalled_grad[idx];
 
+    // NaN/Inf guard: if gradient is corrupted, skip this element entirely.
+    // NaN propagation from a single bad forward/backward pass can corrupt
+    // ALL weights via clamp(NaN) undefined behavior on AMD GPUs.
+    if (isinf(g) || isnan(g) || isinf(r) || isnan(r)) {
+        delta[idx] = 0.0;
+        if (clear_grad != 0u) {
+            grad[idx] = 0.0;
+        }
+        return;
+    }
+
     // 1. Effective gradient: blend current with hippocampal recall
     float g_eff = g + lambda_recall * r;
 
@@ -67,7 +78,12 @@ void main() {
 
     // 3. Biological momentum: EMA of surprise
     float s_prev = s_bar[idx];
+    // Guard against NaN in accumulated surprise (can happen if previous step
+    // wrote NaN before we added this guard)
+    if (isnan(s_prev) || isinf(s_prev)) s_prev = 0.0;
     float s_new = alpha_momentum * instant_pe + (1.0 - alpha_momentum) * s_prev;
+    // Cap surprise to prevent runaway LR amplification
+    s_new = min(s_new, 5.0);
     s_bar[idx] = s_new;
 
     // 4. Adaptive learning rate: surprise amplifies LR
@@ -84,8 +100,11 @@ void main() {
     // Clip to prevent explosion
     d = clamp(d, -clip_max, clip_max);
 
-    // 6. Apply update
-    W[idx] = w - d;
+    // 6. Apply update (with weight clipping to bound predictions)
+    float w_new = w - d;
+    // Final NaN guard on the weight itself
+    if (isnan(w_new) || isinf(w_new)) w_new = 0.0;
+    W[idx] = clamp(w_new, -10.0, 10.0);
     delta[idx] = d;
 
     // Optionally clear gradient

@@ -65,6 +65,37 @@ void WorldModel::add_fact(
     constraints_.insert(constraint_vec, emo);
 }
 
+void WorldModel::add_fact_gpu(
+    CommandBatch& batch, PipelineCache& pipeCache,
+    const std::string& subject,
+    const std::string& relation,
+    const std::string& object) {
+
+    // 1. Encode and store the positive fact (GPU surprise check)
+    auto fact_vec = encode_triple(subject, relation, object);
+    cubemind::EmotionState emo{1.0f, 0.0f};
+    known_facts_.insertGPU(batch, pipeCache, fact_vec, emo);
+
+    // 2. Auto-generate and store the negation constraint (GPU surprise check)
+    std::string neg_rel = negate_relation(relation);
+    auto constraint_vec = encode_triple(subject, neg_rel, object);
+    constraints_.insertGPU(batch, pipeCache, constraint_vec, emo);
+}
+
+void WorldModel::add_fact_unchecked(
+    const std::string& subject,
+    const std::string& relation,
+    const std::string& object) {
+
+    auto fact_vec = encode_triple(subject, relation, object);
+    cubemind::EmotionState emo{1.0f, 0.0f};
+    known_facts_.insertUnchecked(fact_vec, emo);
+
+    std::string neg_rel = negate_relation(relation);
+    auto constraint_vec = encode_triple(subject, neg_rel, object);
+    constraints_.insertUnchecked(constraint_vec, emo);
+}
+
 void WorldModel::add_fact_vec(const cubemind::BitpackedVec& fact_vec) {
     cubemind::EmotionState emo{1.0f, 0.0f};
     known_facts_.insert(fact_vec, emo);

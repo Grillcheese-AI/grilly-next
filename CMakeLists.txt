@@ -146,6 +146,8 @@ add_library(grilly_core_lib STATIC
     cpp/src/cubemind/text_encoder.cpp
     cpp/src/cubemind/semantic_assigner.cpp
     cpp/src/cubemind/resonator.cpp
+    cpp/src/cubemind/multimodal_encoder.cpp
+    cpp/src/cubemind/vsa_inference.cpp
     cpp/src/training/pipeline.cpp
     cpp/src/cognitive/world_model.cpp
     cpp/src/temporal/vulkan_temporal.cpp

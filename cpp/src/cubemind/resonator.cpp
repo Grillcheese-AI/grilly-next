@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -78,6 +79,86 @@ const std::string& ResonatorNetwork::get_word(uint32_t index) const {
     static const std::string kUnknown = "<UNK>";
     if (index < words_.size()) return words_[index];
     return kUnknown;
+}
+
+// ── Codebook Checkpointing ──────────────────────────────────────────
+
+static constexpr uint32_t kCodebookMagic   = 0x47524C59;  // "GRLY"
+static constexpr uint32_t kCodebookVersion = 1;
+
+void ResonatorNetwork::save_codebook(const std::string& path) const {
+    if (!codebook_loaded_)
+        throw std::runtime_error("save_codebook: no codebook loaded");
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out)
+        throw std::runtime_error("save_codebook: cannot open " + path);
+
+    uint32_t count = static_cast<uint32_t>(words_.size());
+    uint32_t dim = dim_;
+
+    // Header
+    out.write(reinterpret_cast<const char*>(&kCodebookMagic), 4);
+    out.write(reinterpret_cast<const char*>(&kCodebookVersion), 4);
+    out.write(reinterpret_cast<const char*>(&count), 4);
+    out.write(reinterpret_cast<const char*>(&dim), 4);
+
+    // Entries
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t word_len = static_cast<uint32_t>(words_[i].size());
+        out.write(reinterpret_cast<const char*>(&word_len), 4);
+        out.write(words_[i].data(), word_len);
+
+        const uint32_t* vec = codebook_host_.data() + i * words_per_vec_;
+        out.write(reinterpret_cast<const char*>(vec),
+                  words_per_vec_ * sizeof(uint32_t));
+    }
+
+    if (!out.good())
+        throw std::runtime_error("save_codebook: write error on " + path);
+}
+
+void ResonatorNetwork::load_codebook_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("load_codebook_file: cannot open " + path);
+
+    uint32_t magic, version, count, dim;
+    in.read(reinterpret_cast<char*>(&magic), 4);
+    in.read(reinterpret_cast<char*>(&version), 4);
+    in.read(reinterpret_cast<char*>(&count), 4);
+    in.read(reinterpret_cast<char*>(&dim), 4);
+
+    if (magic != kCodebookMagic)
+        throw std::runtime_error("load_codebook_file: bad magic (not a GRLY codebook)");
+    if (version != kCodebookVersion)
+        throw std::runtime_error("load_codebook_file: unsupported version " +
+                                 std::to_string(version));
+    if (dim != dim_)
+        throw std::runtime_error("load_codebook_file: dim mismatch (file=" +
+                                 std::to_string(dim) + " resonator=" +
+                                 std::to_string(dim_) + ")");
+
+    std::vector<std::string> words(count);
+    uint32_t file_words_per_vec = (dim + 31) / 32;
+    std::vector<uint32_t> vectors(count * file_words_per_vec);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t word_len;
+        in.read(reinterpret_cast<char*>(&word_len), 4);
+        words[i].resize(word_len);
+        in.read(words[i].data(), word_len);
+
+        uint32_t* vec = vectors.data() + i * file_words_per_vec;
+        in.read(reinterpret_cast<char*>(vec),
+                file_words_per_vec * sizeof(uint32_t));
+    }
+
+    if (!in.good())
+        throw std::runtime_error("load_codebook_file: read error on " + path);
+
+    // Upload to VRAM via the existing load_codebook path
+    load_codebook(words, vectors.data());
 }
 
 // ── GPU Resonation ──────────────────────────────────────────────────────
@@ -312,6 +393,165 @@ std::vector<std::pair<std::string, float>> ResonatorNetwork::generate_sentence(
     return generated;
 }
 
+std::pair<std::string, float> ResonatorNetwork::query_role(
+    const BitpackedVec& bundle,
+    const std::string& role_key,
+    const std::string& key_prefix) {
+
+    // Generate the same BLAKE3 role vector used during encoding
+    std::vector<int8_t> role_bipolar = blake3Role(key_prefix + role_key, dim_);
+    BitpackedVec role_packed = vsaBitpack(role_bipolar.data(), dim_);
+
+    // Unbind: probe = bundle XOR role
+    BitpackedVec probe;
+    probe.dim = dim_;
+    probe.data.resize(words_per_vec_);
+    for (uint32_t j = 0; j < words_per_vec_; ++j) {
+        probe.data[j] = bundle.data[j] ^ role_packed.data[j];
+    }
+
+    // Resonate against codebook to find the filler
+    ResonateResult result = resonate(probe);
+    return {get_word(result.best_index), result.best_similarity};
+}
+
+std::pair<std::string, float> ResonatorNetwork::query_slot(
+    const BitpackedVec& bundle,
+    const std::string& dep_role,
+    uint32_t position) {
+
+    std::vector<int8_t> role_bip = blake3Role("role_" + dep_role, dim_);
+    std::vector<int8_t> pos_bip  = blake3Role("pos_" + std::to_string(position), dim_);
+
+    BitpackedVec role_pk = vsaBitpack(role_bip.data(), dim_);
+    BitpackedVec pos_pk  = vsaBitpack(pos_bip.data(), dim_);
+
+    BitpackedVec probe;
+    probe.dim = dim_;
+    probe.data.resize(words_per_vec_);
+    for (uint32_t j = 0; j < words_per_vec_; ++j) {
+        probe.data[j] = bundle.data[j] ^ role_pk.data[j] ^ pos_pk.data[j];
+    }
+
+    ResonateResult result = resonate(probe);
+    return {get_word(result.best_index), result.best_similarity};
+}
+
+BitpackedVec ResonatorNetwork::compute_analogy_map(
+    const BitpackedVec& source_bundle,
+    const BitpackedVec& target_bundle) {
+
+    BitpackedVec mapping;
+    mapping.dim = dim_;
+    mapping.data.resize(words_per_vec_);
+    for (uint32_t j = 0; j < words_per_vec_; ++j) {
+        // In bipolar VSA, inverse = self, so:
+        // mapping = source^(-1) ⊗ target = source XOR target
+        mapping.data[j] = source_bundle.data[j] ^ target_bundle.data[j];
+    }
+    return mapping;
+}
+
+std::pair<std::string, float> ResonatorNetwork::apply_analogy(
+    const BitpackedVec& analogy_map,
+    const BitpackedVec& query_filler) {
+
+    BitpackedVec probe;
+    probe.dim = dim_;
+    probe.data.resize(words_per_vec_);
+    for (uint32_t j = 0; j < words_per_vec_; ++j) {
+        probe.data[j] = analogy_map.data[j] ^ query_filler.data[j];
+    }
+
+    ResonateResult result = resonate(probe);
+    return {get_word(result.best_index), result.best_similarity};
+}
+
+std::vector<std::pair<std::string, float>> ResonatorNetwork::batch_unbind(
+    const BitpackedVec& bundle,
+    const std::vector<std::string>& role_keys,
+    const std::vector<uint32_t>& positions) {
+
+    uint32_t N = static_cast<uint32_t>(role_keys.size());
+    if (N == 0) return {};
+
+    // 1. Build the operator pool (role XOR pos for each slot)
+    std::vector<uint32_t> op_pool(N * words_per_vec_);
+    for (uint32_t i = 0; i < N; ++i) {
+        auto role_bip = blake3Role("role_" + role_keys[i], dim_);
+        auto pos_bip  = blake3Role("pos_" + std::to_string(positions[i]), dim_);
+        auto role_pk  = vsaBitpack(role_bip.data(), dim_);
+        auto pos_pk   = vsaBitpack(pos_bip.data(), dim_);
+
+        for (uint32_t j = 0; j < words_per_vec_; ++j) {
+            op_pool[i * words_per_vec_ + j] =
+                role_pk.data[j] ^ pos_pk.data[j];
+        }
+    }
+
+    // Output buffer for unbound probes
+    std::vector<uint32_t> hypotheses(N * words_per_vec_, 0);
+
+    // 2. Dispatch vsa-logic-apply.glsl
+    if (pipeCache_.hasShader("vsa-logic-apply")) {
+        size_t mem_bytes = words_per_vec_ * sizeof(uint32_t);
+        size_t ops_bytes = N * words_per_vec_ * sizeof(uint32_t);
+        size_t hyp_bytes = N * words_per_vec_ * sizeof(uint32_t);
+
+        GrillyBuffer bufMem = pool_.acquire(mem_bytes);
+        GrillyBuffer bufOps = pool_.acquire(ops_bytes);
+        GrillyBuffer bufHyp = pool_.acquire(hyp_bytes);
+
+        pool_.upload(bufMem, reinterpret_cast<const float*>(bundle.data.data()), mem_bytes);
+        pool_.upload(bufOps, reinterpret_cast<const float*>(op_pool.data()), ops_bytes);
+
+        PipelineEntry pipe = pipeCache_.getOrCreate("vsa-logic-apply", 3, sizeof(VSALogicApplyParams));
+
+        std::vector<VkDescriptorBufferInfo> bufInfos = {
+            {bufMem.handle, 0, mem_bytes},
+            {bufOps.handle, 0, ops_bytes},
+            {bufHyp.handle, 0, hyp_bytes}
+        };
+
+        VkDescriptorSet descSet = pipeCache_.allocDescriptorSet("vsa-logic-apply", bufInfos);
+
+        VSALogicApplyParams push{words_per_vec_, N, 0, 0};
+
+        batch_.begin();
+        batch_.dispatch(pipe.pipeline, pipe.layout, descSet, N, 1, 1, &push, sizeof(push));
+        batch_.submit();
+
+        pool_.download(bufHyp, reinterpret_cast<float*>(hypotheses.data()), hyp_bytes);
+
+        pool_.release(bufMem);
+        pool_.release(bufOps);
+        pool_.release(bufHyp);
+    } else {
+        // CPU Fallback: XOR the working memory with each operator
+        for (uint32_t i = 0; i < N; ++i) {
+            uint32_t p_off = i * words_per_vec_;
+            for (uint32_t j = 0; j < words_per_vec_; ++j) {
+                hypotheses[p_off + j] = bundle.data[j] ^ op_pool[p_off + j];
+            }
+        }
+    }
+
+    // 3. Batch resonate each probe against codebook
+    std::vector<std::pair<std::string, float>> results;
+    results.reserve(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        BitpackedVec probe;
+        probe.dim = dim_;
+        probe.data.assign(hypotheses.begin() + i * words_per_vec_,
+                          hypotheses.begin() + (i + 1) * words_per_vec_);
+        auto res = resonate(probe);
+        results.push_back({get_word(res.best_index), res.best_similarity});
+    }
+    return results;
+}
+
+
+
 std::vector<std::pair<std::string, float>> ResonatorNetwork::generate_positional(
     const BitpackedVec& sentence_bundle,
     uint32_t length,
@@ -324,6 +564,64 @@ std::vector<std::pair<std::string, float>> ResonatorNetwork::generate_positional
         positions[i] = i;
     }
     return generate_sentence(sentence_bundle, dep_roles, positions, explain_away);
+}
+
+// ── Hyper-NAR Decoding Loop ─────────────────────────────────────────
+//
+// Non-autoregressive generation via VSA geometric trajectories.
+// The entire generative step requires exactly:
+//   1. One lightweight MLP forward pass (the hypernetwork predictor)
+//   2. One vsaBind operation (bitwise XOR in bipolar domain)
+//   3. One resonator.resonate() GPU Hamming search
+//
+// No context window. No quadratic attention. Just XOR + POPCNT.
+
+std::vector<std::string> hyper_nar_decode(
+    const BitpackedVec& fused_prompt_state,
+    ResonatorNetwork& resonator,
+    HypernetworkPredictor predictor,
+    uint32_t max_tokens) {
+
+    std::vector<std::string> generated_sequence;
+    uint32_t dim = fused_prompt_state.dim;
+
+    // Initialize the generative state with our fused multimodal prompt
+    BitpackedVec current_state = fused_prompt_state;
+
+    for (uint32_t i = 0; i < max_tokens; ++i) {
+        // 1. The Student Hypernetwork predicts the structural transition vector
+        std::vector<int8_t> transformation = predictor(current_state);
+
+        // 2. Unpack the bitpacked current state back to bipolar {-1, 1}
+        std::vector<int8_t> unpacked_state = vsaUnpack(current_state);
+
+        // 3. Execute the structural transition via VSA Binding
+        //    (element-wise multiply in bipolar = XOR in bitpacked)
+        std::vector<int8_t> target_state =
+            vsaBind(unpacked_state.data(), transformation.data(), dim);
+
+        // 4. Pack the newly generated target state
+        BitpackedVec packed_target = vsaBitpack(target_state.data(), dim);
+
+        // 5. Resonate: GPU Hamming search against the entire vocabulary
+        //    to snap the noisy trajectory to a crisp, readable word
+        ResonateResult result = resonator.resonate(packed_target, false);
+
+        // 6. Extract the human-readable string
+        std::string decoded_word = resonator.get_word(result.best_index);
+        generated_sequence.push_back(decoded_word);
+
+        // 7. Stop generation if the network predicts End-Of-Sequence
+        if (decoded_word == "<EOS>") {
+            break;
+        }
+
+        // 8. Update state for next iteration
+        // Use the resolved packed target to prevent drift accumulation
+        current_state = packed_target;
+    }
+
+    return generated_sequence;
 }
 
 }  // namespace cubemind

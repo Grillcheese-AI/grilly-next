@@ -102,11 +102,34 @@ struct HammingTopKParams {
     uint32_t queryOffset;
 };
 
+/// Push constants for vsa-logic-apply.glsl (16 bytes).
+/// Batch XOR binding: applies N operators to a single state vector in parallel.
+/// Each workgroup handles one operator, producing one hypothesis vector.
+struct VSALogicApplyParams {
+    uint32_t words_per_vec;   // dim / 32 (e.g., 320)
+    uint32_t num_ops;         // Number of logic operators to apply
+    uint32_t _pad0;
+    uint32_t _pad1;
+};
+
 /// Push constants for vsa-bitpack.glsl (8 bytes).
 /// Converts float bipolar {-1.0, +1.0} to packed uint32 bits on GPU.
 struct BitpackParams {
     uint32_t totalElements;  // Number of bipolar elements (= dim)
     uint32_t numWords;       // Output words (= (dim+31)/32)
+};
+
+/// BDA push constants for hamming-search-bda.glsl (40 bytes).
+/// Uses raw 64-bit GPU pointers instead of descriptor set bindings,
+/// eliminating descriptor allocation overhead entirely.
+struct HammingSearchBDAParams {
+    uint64_t queryPtr;       // BDA pointer to query bitpacked vector
+    uint64_t cachePtr;       // BDA pointer to cache bitpacked vectors
+    uint64_t distPtr;        // BDA pointer to output distances
+    uint32_t numEntries;     // Number of cache entries to search
+    uint32_t wordsPerVec;    // uint32 words per bitpacked vector (dim/32)
+    uint32_t numQueries;     // Batch query count
+    uint32_t queryOffset;    // Which query to process (for batched dispatch)
 };
 
 }  // namespace cubemind

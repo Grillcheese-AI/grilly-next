@@ -32,6 +32,8 @@
 #include "grilly/cubemind/text_encoder.h"
 #include "grilly/cubemind/semantic_assigner.h"
 #include "grilly/cubemind/resonator.h"
+#include "grilly/cubemind/multimodal_encoder.h"
+#include "grilly/cubemind/vsa_inference.h"
 #include "grilly/training/pipeline.h"
 #include "grilly/cognitive/world_model.h"
 #include "grilly/temporal/temporal_encoder.h"
@@ -1650,6 +1652,26 @@ PYBIND11_MODULE(grilly_core, m) {
              },
              py::arg("key"), py::arg("surprise") = 1.0f,
              py::arg("stress") = 0.0f)
+        .def("insert_packed_gpu",
+             [](grilly::cubemind::VSACache& cache,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> key_packed,
+                float surprise, float stress) -> bool {
+                 auto buf = key_packed.request();
+                 uint32_t words = static_cast<uint32_t>(buf.shape[0]);
+
+                 grilly::cubemind::BitpackedVec packed;
+                 packed.dim = words * 32;
+                 packed.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + words);
+
+                 grilly::cubemind::EmotionState emo{surprise, stress};
+                 return cache.insertGPU(ctx.batch, ctx.cache, packed, emo);
+             },
+             py::arg("device"), py::arg("key_packed"),
+             py::arg("surprise") = 1.0f, py::arg("stress") = 0.0f,
+             "GPU-accelerated insert with pre-bitpacked key")
         .def("evict", &grilly::cubemind::VSACache::evict, py::arg("count"))
         .def("size", &grilly::cubemind::VSACache::size)
         .def("stats",
@@ -1666,6 +1688,15 @@ PYBIND11_MODULE(grilly_core, m) {
                  d["last_lookup_ms"] = s.lastLookupMs;
                  return d;
              });
+
+    // ── CubeMind: VSA Primitives ──────────────────────────────────────
+
+    m.def("blake3_role",
+          [](const std::string& key, uint32_t dim, const std::string& domain) -> py::array_t<int8_t> {
+              auto vec = grilly::cubemind::blake3Role(key, dim, domain);
+              return py::array_t<int8_t>(vec.size(), vec.data());
+          },
+          py::arg("key"), py::arg("dim"), py::arg("domain") = "grilly.cubemind");
 
     // ── CubeMind: TextEncoder (FastText LSH → Bipolar VSA) ────────────
 
@@ -1790,6 +1821,106 @@ PYBIND11_MODULE(grilly_core, m) {
         .def_property_readonly("ft_dim",
              &grilly::cubemind::SemanticAssigner::ft_dim);
 
+    // ── CubeMind: MultimodalEncoder (Vision-Text VSA Fusion) ────────────
+
+    py::class_<grilly::cubemind::MultimodalEncoder>(m, "MultimodalEncoder")
+        .def(py::init<uint32_t, uint32_t>(),
+             py::arg("dim") = 10240, py::arg("vit_dim") = 768)
+        .def("project_image_features",
+             [](const grilly::cubemind::MultimodalEncoder& enc,
+                py::array_t<float> vit_features) -> py::array_t<int8_t> {
+                 auto buf = vit_features.request();
+                 auto result = enc.project_image_features(
+                     static_cast<const float*>(buf.ptr));
+                 return py::array_t<int8_t>(result.size(), result.data());
+             },
+             py::arg("vit_features"),
+             "Project dense float image features into VSA bipolar space")
+        .def("fuse_with_text",
+             [](const grilly::cubemind::MultimodalEncoder& enc,
+                py::array_t<int8_t> image_bipolar,
+                py::array_t<uint32_t> text_packed) -> py::dict {
+                 auto ibuf = image_bipolar.request();
+                 auto tbuf = text_packed.request();
+
+                 std::vector<int8_t> img_vec(
+                     static_cast<int8_t*>(ibuf.ptr),
+                     static_cast<int8_t*>(ibuf.ptr) + ibuf.size);
+
+                 grilly::cubemind::BitpackedVec text_bundle;
+                 text_bundle.data.assign(
+                     static_cast<uint32_t*>(tbuf.ptr),
+                     static_cast<uint32_t*>(tbuf.ptr) + tbuf.size);
+                 text_bundle.dim = text_bundle.data.size() * 32;
+
+                 auto fused = enc.fuse_with_text(img_vec, text_bundle);
+                 py::dict d;
+                 d["data"] = py::array_t<uint32_t>(
+                     fused.data.size(), fused.data.data());
+                 d["dim"] = fused.dim;
+                 d["num_words"] = fused.numWords();
+                 return d;
+             },
+             py::arg("image_bipolar"), py::arg("text_packed"),
+             "Fuse image bipolar vector with text bundle into single state")
+        .def_property_readonly("dim",
+             &grilly::cubemind::MultimodalEncoder::dim)
+        .def_property_readonly("vit_dim",
+             &grilly::cubemind::MultimodalEncoder::vit_dim);
+
+    // ── CubeMind: VSAInferenceEngine (Binary XNOR+POPCNT Inference) ──────
+
+    py::class_<grilly::cubemind::VSAInferenceEngine>(m, "VSAInferenceEngine")
+        .def(py::init(
+                 [](GrillyCoreContext& ctx, uint32_t state_dim) {
+                     return new grilly::cubemind::VSAInferenceEngine(
+                         ctx.pool, state_dim);
+                 }),
+             py::arg("device"), py::arg("state_dim") = 10240,
+             py::keep_alive<1, 2>())
+        .def("load_weights",
+             py::overload_cast<const std::string&>(
+                 &grilly::cubemind::VSAInferenceEngine::load_weights),
+             py::arg("filepath"),
+             "Load binarized weights from a binary file into persistent GPU buffer")
+        .def("load_weights_array",
+             [](grilly::cubemind::VSAInferenceEngine& engine,
+                py::array_t<uint32_t> weights) {
+                 auto buf = weights.request();
+                 engine.load_weights(
+                     static_cast<const uint32_t*>(buf.ptr), buf.size);
+             },
+             py::arg("weights"),
+             "Load binarized weights from a numpy uint32 array")
+        .def("infer",
+             [](grilly::cubemind::VSAInferenceEngine& engine,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> input_packed) -> py::dict {
+                 auto buf = input_packed.request();
+                 grilly::cubemind::BitpackedVec input;
+                 input.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 input.dim = input.data.size() * 32;
+
+                 auto result = engine.infer(ctx.batch, ctx.cache, input);
+                 py::dict d;
+                 d["data"] = py::array_t<uint32_t>(
+                     result.data.size(), result.data.data());
+                 d["dim"] = result.dim;
+                 return d;
+             },
+             py::arg("device"), py::arg("input_packed"),
+             "Execute XNOR inference: predicted = XNOR(input, weights)")
+        .def_property_readonly("weights_loaded",
+             &grilly::cubemind::VSAInferenceEngine::weights_loaded)
+        .def_property_readonly("weights_device_address",
+             &grilly::cubemind::VSAInferenceEngine::weights_device_address)
+        .def_property_readonly("weight_words",
+             &grilly::cubemind::VSAInferenceEngine::weight_words)
+        .def_property_readonly("state_dim",
+             &grilly::cubemind::VSAInferenceEngine::state_dim);
+
     // ── CubeMind: ResonatorNetwork (GPU Hamming Similarity Generation) ──
 
     py::class_<grilly::cubemind::ResonatorNetwork>(m, "ResonatorNetwork")
@@ -1873,6 +2004,138 @@ PYBIND11_MODULE(grilly_core, m) {
              py::arg("dependency_roles"),
              py::arg("positions"),
              py::arg("explain_away") = true)
+        // ── Inference: Open-Ended Unbinding ──────────────────────────
+        .def("query_role",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> bundle_packed,
+                const std::string& role_key,
+                const std::string& key_prefix) -> py::dict {
+                 auto buf = bundle_packed.request();
+                 grilly::cubemind::BitpackedVec bundle;
+                 bundle.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 bundle.dim = bundle.data.size() * 32;
+
+                 auto [word, sim] = res.query_role(bundle, role_key, key_prefix);
+                 py::dict d;
+                 d["word"] = word;
+                 d["similarity"] = sim;
+                 return d;
+             },
+             py::arg("bundle_packed"), py::arg("role_key"),
+             py::arg("key_prefix") = "role_",
+             "Unbind a single role from a bundle and resonate against codebook.\n"
+             "VSA equivalent of a key->value lookup in a hash table.")
+        .def("query_slot",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> bundle_packed,
+                const std::string& dep_role,
+                uint32_t position) -> py::dict {
+                 auto buf = bundle_packed.request();
+                 grilly::cubemind::BitpackedVec bundle;
+                 bundle.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 bundle.dim = bundle.data.size() * 32;
+
+                 auto [word, sim] = res.query_slot(bundle, dep_role, position);
+                 py::dict d;
+                 d["word"] = word;
+                 d["similarity"] = sim;
+                 return d;
+             },
+             py::arg("bundle_packed"), py::arg("dep_role"), py::arg("position"),
+             "Query a specific (role, position) slot from a sentence bundle.\n"
+             "Three-way unbind: probe = bundle XOR role XOR position.")
+        // ── Inference: Analogical Reasoning ─────────────────────────
+        .def("compute_analogy_map",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> source_packed,
+                py::array_t<uint32_t> target_packed) -> py::array_t<uint32_t> {
+                 auto sbuf = source_packed.request();
+                 auto tbuf = target_packed.request();
+                 grilly::cubemind::BitpackedVec source, target;
+                 source.data.assign(
+                     static_cast<uint32_t*>(sbuf.ptr),
+                     static_cast<uint32_t*>(sbuf.ptr) + sbuf.size);
+                 source.dim = source.data.size() * 32;
+                 target.data.assign(
+                     static_cast<uint32_t*>(tbuf.ptr),
+                     static_cast<uint32_t*>(tbuf.ptr) + tbuf.size);
+                 target.dim = target.data.size() * 32;
+
+                 auto mapping = res.compute_analogy_map(source, target);
+                 py::array_t<uint32_t> arr(mapping.data.size());
+                 std::memcpy(arr.mutable_data(), mapping.data.data(),
+                             mapping.data.size() * sizeof(uint32_t));
+                 return arr;
+             },
+             py::arg("source_packed"), py::arg("target_packed"),
+             "Compute analogical mapping: source XOR target.\n"
+             "Then bind(mapping, source_filler) ~ target_filler.")
+        .def("apply_analogy",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> analogy_map,
+                py::array_t<uint32_t> query_filler_packed) -> py::dict {
+                 auto mbuf = analogy_map.request();
+                 auto qbuf = query_filler_packed.request();
+                 grilly::cubemind::BitpackedVec mapping, query;
+                 mapping.data.assign(
+                     static_cast<uint32_t*>(mbuf.ptr),
+                     static_cast<uint32_t*>(mbuf.ptr) + mbuf.size);
+                 mapping.dim = mapping.data.size() * 32;
+                 query.data.assign(
+                     static_cast<uint32_t*>(qbuf.ptr),
+                     static_cast<uint32_t*>(qbuf.ptr) + qbuf.size);
+                 query.dim = query.data.size() * 32;
+
+                 auto [word, sim] = res.apply_analogy(mapping, query);
+                 py::dict d;
+                 d["word"] = word;
+                 d["similarity"] = sim;
+                 return d;
+             },
+             py::arg("analogy_map"), py::arg("query_filler_packed"),
+             "Apply analogical mapping to a query filler and resonate.\n"
+             "'If USD maps to X in the target frame, what is X?'")
+        // ── Inference: Batch GPU Unbinding ──────────────────────────
+        .def("batch_unbind",
+             [](grilly::cubemind::ResonatorNetwork& res,
+                py::array_t<uint32_t> bundle_packed,
+                std::vector<std::string> role_keys,
+                std::vector<uint32_t> positions) -> py::list {
+                 auto buf = bundle_packed.request();
+                 grilly::cubemind::BitpackedVec bundle;
+                 bundle.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 bundle.dim = bundle.data.size() * 32;
+
+                 auto results = res.batch_unbind(bundle, role_keys, positions);
+                 py::list out;
+                 for (auto& [word, sim] : results) {
+                     py::dict entry;
+                     entry["word"] = word;
+                     entry["similarity"] = sim;
+                     out.append(entry);
+                 }
+                 return out;
+             },
+             py::arg("bundle_packed"), py::arg("role_keys"), py::arg("positions"),
+             "Unbind N (role, position) slots in parallel on GPU, then batch-resonate.\n"
+             "Uses vsa-logic-apply.glsl with CPU fallback.")
+        // ── Codebook Checkpointing ──────────────────────────────────
+        .def("save_codebook",
+             &grilly::cubemind::ResonatorNetwork::save_codebook,
+             py::arg("path"),
+             "Save codebook to binary file for checkpointing.\n"
+             "Format: GRLY magic + version + count + dim + entries.")
+        .def("load_codebook_file",
+             &grilly::cubemind::ResonatorNetwork::load_codebook_file,
+             py::arg("path"),
+             "Load codebook from binary checkpoint file and upload to VRAM.")
+        // ── Properties ──────────────────────────────────────────────
         .def_property_readonly("codebook_size",
              &grilly::cubemind::ResonatorNetwork::codebook_size)
         .def("get_word",
@@ -1882,6 +2145,48 @@ PYBIND11_MODULE(grilly_core, m) {
              &grilly::cubemind::ResonatorNetwork::total_resonations)
         .def_property_readonly("last_resonate_ms",
              &grilly::cubemind::ResonatorNetwork::last_resonate_ms);
+
+    // ── CubeMind: Hyper-NAR Decoding Loop ────────────────────────────────
+
+    m.def("hyper_nar_decode",
+          [](py::array_t<uint32_t> fused_state_packed,
+             grilly::cubemind::ResonatorNetwork& resonator,
+             py::function predictor_fn,
+             uint32_t max_tokens) -> py::list {
+              auto buf = fused_state_packed.request();
+              grilly::cubemind::BitpackedVec state;
+              state.data.assign(
+                  static_cast<uint32_t*>(buf.ptr),
+                  static_cast<uint32_t*>(buf.ptr) + buf.size);
+              state.dim = state.data.size() * 32;
+
+              // Wrap Python callable as C++ HypernetworkPredictor
+              grilly::cubemind::HypernetworkPredictor cpp_predictor =
+                  [&predictor_fn](const grilly::cubemind::BitpackedVec& s)
+                      -> std::vector<int8_t> {
+                      py::array_t<uint32_t> arr(s.data.size());
+                      std::memcpy(arr.mutable_data(), s.data.data(),
+                                  s.data.size() * sizeof(uint32_t));
+                      py::array_t<int8_t> result = predictor_fn(arr).cast<py::array_t<int8_t>>();
+                      auto rbuf = result.request();
+                      return std::vector<int8_t>(
+                          static_cast<int8_t*>(rbuf.ptr),
+                          static_cast<int8_t*>(rbuf.ptr) + rbuf.size);
+                  };
+
+              auto words = grilly::cubemind::hyper_nar_decode(
+                  state, resonator, cpp_predictor, max_tokens);
+
+              py::list out;
+              for (auto& w : words) out.append(w);
+              return out;
+          },
+          py::arg("fused_state_packed"),
+          py::arg("resonator"),
+          py::arg("predictor"),
+          py::arg("max_tokens") = 50,
+          "Hyper-NAR decoding: non-autoregressive generation via VSA trajectories.\n"
+          "predictor(packed_state) -> bipolar_int8_array");
 
     // ── Training Pipeline: Producer-Consumer Data Loading ───────────────
 
@@ -2029,6 +2334,25 @@ PYBIND11_MODULE(grilly_core, m) {
              &grilly::cognitive::WorldModel::add_fact,
              py::arg("subject"), py::arg("relation"), py::arg("object"),
              "Add a (S, R, O) fact and auto-generate negation constraint")
+        .def("add_fact_gpu",
+             [](grilly::cognitive::WorldModel& wm,
+                GrillyCoreContext& ctx,
+                const std::string& subject,
+                const std::string& relation,
+                const std::string& object) {
+                 wm.add_fact_gpu(ctx.batch, ctx.cache,
+                                 subject, relation, object);
+             },
+             py::arg("device"),
+             py::arg("subject"), py::arg("relation"), py::arg("object"),
+             "GPU-accelerated fact insertion (uses GPU Hamming search "
+             "for surprise check, avoiding O(n^2) CPU bottleneck)")
+        .def("add_fact_unchecked",
+             &grilly::cognitive::WorldModel::add_fact_unchecked,
+             py::arg("subject"), py::arg("relation"), py::arg("object"),
+             "Bulk-ingestion insert: skips surprise check (O(1) per fact). "
+             "Use for pre-deduplicated data where the O(n^2) CPU scan "
+             "is unnecessary.")
         .def("check_coherence",
              [](grilly::cognitive::WorldModel& wm,
                 GrillyCoreContext& ctx,
@@ -2184,6 +2508,23 @@ PYBIND11_MODULE(grilly_core, m) {
           "    continuous_deltas: Float predictions [K, D] or [1, K, D]\n"
           "    world_model: WorldModel with loaded constraints\n\n"
           "Returns: ManyWorldsResult with violation counts and future states");
+
+    m.def("interpret_trajectory",
+          [](const grilly::generation::ManyWorldsResult& mw_result,
+             grilly::cubemind::ResonatorNetwork& resonator,
+             const std::string& dep_role,
+             uint32_t position) -> py::dict {
+              auto [word, sim] = grilly::generation::interpret_trajectory(
+                  mw_result, resonator, dep_role, position);
+              py::dict d;
+              d["word"] = word;
+              d["similarity"] = sim;
+              return d;
+          },
+          py::arg("mw_result"), py::arg("resonator"),
+          py::arg("dep_role"), py::arg("position"),
+          "Interpret the best trajectory from many-worlds via resonator unbinding.\n"
+          "Returns {word, similarity} for a specific (role, position) slot.");
 
     // ── Hippocampal Consolidator (Offline Dream Cycle) ──────────────────
 
@@ -2454,15 +2795,17 @@ PYBIND11_MODULE(grilly_core, m) {
         .def(py::init(
                  [](GrillyCoreContext& ctx,
                     uint32_t d_model, uint32_t vsa_dim,
-                    uint32_t K, uint32_t seed) {
+                    uint32_t K, uint32_t router_hidden,
+                    uint32_t seed) {
                      return new grilly::models::VSAHypernetwork(
                          ctx.pool, ctx.batch, ctx.cache,
-                         d_model, vsa_dim, K, seed);
+                         d_model, vsa_dim, K, router_hidden, seed);
                  }),
              py::arg("device"),
              py::arg("d_model") = 768,
              py::arg("vsa_dim") = 10240,
-             py::arg("K") = 4,
+             py::arg("K") = 16,
+             py::arg("router_hidden") = 32,
              py::arg("seed") = 42,
              py::keep_alive<1, 2>())
         .def("forward",
@@ -2484,6 +2827,12 @@ PYBIND11_MODULE(grilly_core, m) {
              &grilly::models::VSAHypernetwork::vsa_dim)
         .def_property_readonly("K",
              &grilly::models::VSAHypernetwork::K)
+        .def_property_readonly("router_hidden",
+             &grilly::models::VSAHypernetwork::router_hidden)
+        .def("h_t_buffer_id",
+             [](grilly::models::VSAHypernetwork& self) -> uint64_t {
+                 return self.h_t().buffer_id;
+             })
         .def("forward_inference",
              [](grilly::models::VSAHypernetwork& self,
                 GrillyCoreContext& ctx,
@@ -2495,14 +2844,18 @@ PYBIND11_MODULE(grilly_core, m) {
                  auto* data = static_cast<uint32_t*>(buf.ptr);
                  uint32_t num_words = static_cast<uint32_t>(buf.shape[0]);
 
-                 auto state_ref = grilly::autograd::upload_bitpacked(
-                     ctx.pool, data, num_words, self.vsa_dim());
-
                  tape.begin();
+
+                 auto state_ref = grilly::autograd::upload_bitpacked(
+                     tape, data, num_words, self.vsa_dim());
+
                  self.forward(tape, state_ref);
 
                  // Readback K * vsa_dim floats from the mapped output buffer
                  auto vec = self.readback_output();
+
+                 tape.end();
+
                  uint32_t K = self.K();
                  uint32_t D = self.vsa_dim();
                  py::array_t<float> arr({K, D});
@@ -2519,38 +2872,219 @@ PYBIND11_MODULE(grilly_core, m) {
              "    vsa_state: Bitpacked uint32 state [words_per_vec]\n\n"
              "Returns: numpy float32 array [K, vsa_dim]");
 
+    // ── VSAHypernetwork save/load weights ─────────────────────────────────
+    m.def("save_hypernetwork_weights",
+          [](grilly::models::VSAHypernetwork& model,
+             const std::string& path) {
+              uint32_t d = model.d_model();
+              uint32_t v = model.vsa_dim();
+              uint32_t K = model.K();
+              uint32_t rh = model.router_hidden();
+              uint32_t h = d * 2;
+
+              // 10 weight buffers: W_proj, b_proj, W1, b1, W2, b2,
+              //                    W_r1, b_r1, W_r2, b_r2
+              uint32_t sizes[] = {
+                  d * v,          // W_proj [d_model, vsa_dim]
+                  d,              // b_proj [d_model]
+                  h * d,          // W1 [hidden, d_model]
+                  h,              // b1 [hidden]
+                  K * v * h,      // W2 [K*vsa_dim, hidden]  (full-rank)
+                  K * v,          // b2 [K*vsa_dim]
+                  rh * d,         // W_r1 [router_hidden, d_model]
+                  rh,             // b_r1 [router_hidden]
+                  K * rh,         // W_r2 [K, router_hidden]
+                  K,              // b_r2 [K]
+              };
+              const auto* bufs = model.weight_buffers();
+
+              FILE* f = fopen(path.c_str(), "wb");
+              if (!f) throw std::runtime_error("Cannot open " + path);
+
+              // Header: magic, d_model, vsa_dim, K, num_params, router_hidden
+              uint32_t header[] = {0x47524C59, d, v, K, 10, rh};  // "GRLY" v3
+              fwrite(header, sizeof(uint32_t), 6, f);
+
+              for (size_t i = 0; i < 10; ++i) {
+                  fwrite(&sizes[i], sizeof(uint32_t), 1, f);
+                  fwrite(bufs[i].mappedPtr, sizeof(float), sizes[i], f);
+              }
+              fclose(f);
+          },
+          py::arg("model"), py::arg("path"),
+          "Save VSAHypernetwork weights to binary file.");
+
+    m.def("load_hypernetwork_weights",
+          [](grilly::models::VSAHypernetwork& model,
+             const std::string& path) {
+              uint32_t d = model.d_model();
+              uint32_t v = model.vsa_dim();
+              uint32_t K = model.K();
+
+              const auto* bufs = model.weight_buffers();
+
+              FILE* f = fopen(path.c_str(), "rb");
+              if (!f) throw std::runtime_error("Cannot open " + path);
+
+              // Read header (v3: 6 words; v2: 7 words; v1: 5 words)
+              uint32_t header[7] = {};
+              fread(header, sizeof(uint32_t), 6, f);
+              if (header[0] != 0x47524C59) {
+                  fclose(f);
+                  throw std::runtime_error("Invalid checkpoint magic");
+              }
+              if (header[1] != d || header[2] != v || header[3] != K) {
+                  fclose(f);
+                  throw std::runtime_error("Model dimension mismatch");
+              }
+
+              uint32_t num_params = header[4];
+              for (size_t i = 0; i < num_params && i < model.num_weight_bufs(); ++i) {
+                  uint32_t size;
+                  fread(&size, sizeof(uint32_t), 1, f);
+                  fread(bufs[i].mappedPtr, sizeof(float), size, f);
+              }
+              fclose(f);
+          },
+          py::arg("model"), py::arg("path"),
+          "Load VSAHypernetwork weights from binary file.");
+
+    // ── Surprise-Momentum Optimizer ─────────────────────────────────────
+    //
+    // GPU optimizer that modulates learning rate by hippocampal surprise.
+    // Dispatches surprise-momentum.spv per-parameter between backward()
+    // and tape.end(), so gradients are applied before the arena resets.
+    //
+    // For now, recalled_grad is zero (no hippocampal gradient recall yet),
+    // which degrades to: g_eff = grad, surprise = |grad|, adaptive LR.
+
+    struct SurpriseMomentumOptimizer {
+        struct ParamEntry {
+            uint64_t weight_id;       // VkBuffer handle for the weight
+            uint32_t num_elements;    // total floats in this parameter
+            grilly::GrillyBuffer s_bar;  // persistent surprise accumulator
+        };
+
+        std::vector<ParamEntry> params;
+        grilly::GrillyBuffer zero_buf;     // shared zero buffer (recalled_grad)
+        grilly::GrillyBuffer delta_buf;    // shared scratch (update output)
+        uint32_t max_elements = 0;
+
+        // Hyperparameters (matching surprise-momentum.glsl push constants)
+        float eta_base        = 0.001f;
+        float alpha_momentum  = 0.9f;
+        float lambda_recall   = 0.0f;   // 0 until hippocampal recall wired
+        float surprise_floor  = 0.01f;
+        float weight_decay    = 0.0f;
+        float clip_max        = 1.0f;
+    };
+
+    py::class_<SurpriseMomentumOptimizer>(m, "SurpriseMomentumOptimizer")
+        .def(py::init([](GrillyCoreContext& ctx,
+                         grilly::models::VSAHypernetwork& model,
+                         float lr, float alpha, float clip) {
+            SurpriseMomentumOptimizer opt;
+            opt.eta_base = lr;
+            opt.alpha_momentum = alpha;
+            opt.clip_max = clip;
+
+            // Compute parameter sizes from model dimensions
+            uint32_t d = model.d_model();
+            uint32_t v = model.vsa_dim();
+            uint32_t K = model.K();
+            uint32_t rh = model.router_hidden();
+            uint32_t h = d * 2;  // hidden dim
+
+            auto buf_ids = model.parameter_buffer_ids();
+            // Order: W_proj, b_proj, W1, b1, W2, b2, W_r1, b_r1, W_r2, b_r2
+            uint32_t sizes[] = {
+                d * v,        // W_proj: d_model x vsa_dim
+                d,            // b_proj: d_model
+                h * d,        // W1: hidden x d_model
+                h,            // b1: hidden
+                K * v * h,    // W2: (K*vsa_dim) x hidden  [full-rank]
+                K * v,        // b2: K*vsa_dim
+                rh * d,       // W_r1: router_hidden x d_model
+                rh,           // b_r1: router_hidden
+                K * rh,       // W_r2: K x router_hidden
+                K,            // b_r2: K
+            };
+
+            for (size_t i = 0; i < buf_ids.size() && i < 10; ++i) {
+                SurpriseMomentumOptimizer::ParamEntry pe;
+                pe.weight_id = buf_ids[i];
+                pe.num_elements = sizes[i];
+
+                // Allocate zero-initialized s_bar
+                size_t bytes = size_t(sizes[i]) * sizeof(float);
+                pe.s_bar = ctx.pool.acquire(bytes);
+                std::memset(pe.s_bar.mappedPtr, 0, bytes);
+
+                if (sizes[i] > opt.max_elements)
+                    opt.max_elements = sizes[i];
+
+                opt.params.push_back(std::move(pe));
+            }
+
+            // Shared zero buffer for recalled_grad (size of largest param)
+            size_t max_bytes = size_t(opt.max_elements) * sizeof(float);
+            opt.zero_buf = ctx.pool.acquire(max_bytes);
+            std::memset(opt.zero_buf.mappedPtr, 0, max_bytes);
+
+            // Shared delta scratch buffer
+            opt.delta_buf = ctx.pool.acquire(max_bytes);
+            std::memset(opt.delta_buf.mappedPtr, 0, max_bytes);
+
+            return opt;
+        }),
+        py::arg("device"), py::arg("model"),
+        py::arg("lr") = 0.001f, py::arg("alpha") = 0.9f,
+        py::arg("clip") = 1.0f,
+        "Create surprise-momentum optimizer for VSAHypernetwork parameters.")
+        .def_readwrite("eta_base", &SurpriseMomentumOptimizer::eta_base)
+        .def_readwrite("alpha_momentum", &SurpriseMomentumOptimizer::alpha_momentum)
+        .def_readwrite("lambda_recall", &SurpriseMomentumOptimizer::lambda_recall)
+        .def_readwrite("surprise_floor", &SurpriseMomentumOptimizer::surprise_floor)
+        .def_readwrite("weight_decay", &SurpriseMomentumOptimizer::weight_decay)
+        .def_readwrite("clip_max", &SurpriseMomentumOptimizer::clip_max);
+
     m.def("vsa_training_step",
           [](GrillyCoreContext& ctx,
              grilly::autograd::TapeContext& tape,
              grilly::models::VSAHypernetwork& model,
              py::array_t<uint32_t> vsa_state_np,
-             py::array_t<uint32_t> true_delta_np) -> float {
-              // Upload VSA state
+             py::array_t<uint32_t> true_delta_np,
+             py::object optimizer) -> float {
               auto state_buf = vsa_state_np.request();
               auto* state_data = static_cast<uint32_t*>(state_buf.ptr);
               uint32_t num_words = static_cast<uint32_t>(state_buf.shape[0]);
 
-              auto state_ref = grilly::autograd::upload_bitpacked(
-                  ctx.pool, state_data, num_words, model.vsa_dim());
-
               tape.begin();
+
+              // Upload VSA state (step-scoped buffer)
+              auto state_ref = grilly::autograd::upload_bitpacked(
+                  tape, state_data, num_words, model.vsa_dim());
 
               // Forward
               auto predicted = model.forward(tape, state_ref);
 
-              // Upload true delta
+              // Upload true delta (step-scoped buffer)
               auto delta_buf = true_delta_np.request();
               auto* delta_data = static_cast<uint32_t*>(delta_buf.ptr);
               auto delta_ref = grilly::autograd::upload_bitpacked(
-                  ctx.pool, delta_data, num_words, model.vsa_dim());
+                  tape, delta_data, num_words, model.vsa_dim());
 
-              // Record loss
+              // ── Record surrogate loss (hinge + contrastive with Gumbel-softmax) ──
+              uint32_t K = model.K();
+
               grilly::autograd::VSASurrogateLossParams loss_params{};
-              loss_params.gamma = 0.1f;
-              loss_params.delta_margin = 0.5f;
-              loss_params.lambda = 0.1f;
-              loss_params.K = model.K();
+              loss_params.gamma = 1.0f;          // Hinge margin (forces pred magnitude > 1.0)
+              loss_params.delta_margin = 1.0f;    // Contrastive branch separation
+              loss_params.lambda = 0.3f;          // Contrastive weight
+              loss_params.K = K;
               loss_params.D = model.vsa_dim();
+              loss_params.temperature = 1.0f;     // Gumbel-softmax temperature
+              loss_params.diversity_lambda = 0.01f;
 
               grilly::autograd::TensorRef loss_output{};
               loss_output.ndim = 1;
@@ -2565,19 +3099,205 @@ PYBIND11_MODULE(grilly_core, m) {
                   loss_inputs, 2, loss_outputs, 1,
                   &loss_params, sizeof(loss_params));
 
-              // Forward loss
+              // Forward loss (Gumbel-softmax winner selection + all-K routing inside)
               float loss = grilly::autograd::dispatch_vsa_loss_forward(
-                  ctx.pool, ctx.batch, ctx.cache, loss_node);
+                  tape, ctx.batch, ctx.cache, loss_node);
 
               // Backward
               tape.backward(loss_node, 0ULL);
+
+              // ── Optimizer step (between backward and end) ──────────
+              // Gradients are in BufferPool, accessible via
+              // tape.get_grad_buffer(). We must apply them before
+              // tape.end() releases the gradient buffers.
+              if (!optimizer.is_none()) {
+                  auto& opt = optimizer.cast<SurpriseMomentumOptimizer&>();
+
+                  // Push constants matching surprise-momentum.glsl layout
+                  struct SMPush {
+                      uint32_t total_elems;
+                      float    eta_base;
+                      float    alpha_momentum;
+                      float    lambda_recall;
+                      float    surprise_floor;
+                      float    weight_decay;
+                      float    clip_max;
+                      uint32_t clear_grad;
+                  };
+
+                  grilly::PipelineEntry pipe = ctx.cache.getOrCreate(
+                      "surprise-momentum", 5, sizeof(SMPush));
+
+                  // Batch all parameter updates in one command buffer
+                  ctx.batch.begin();
+
+                  // maxStorageBufferRange = 128 MB on many GPUs. Chunk large params.
+                  constexpr size_t kMaxRange = 128ULL * 1024 * 1024;
+                  constexpr uint32_t kMaxElems = uint32_t(kMaxRange / sizeof(float));  // 33554432
+
+                  uint32_t grad_found = 0, grad_missing = 0;
+                  for (auto& p : opt.params) {
+                      uint64_t grad_id = tape.get_grad_buffer(p.weight_id);
+                      if (grad_id == 0) {
+                          grad_missing++;
+                          continue;  // no gradient for this param
+                      }
+                      grad_found++;
+
+                      // Split into chunks if param exceeds maxStorageBufferRange
+                      uint32_t num_chunks = (p.num_elements + kMaxElems - 1) / kMaxElems;
+
+                      for (uint32_t c = 0; c < num_chunks; ++c) {
+                          uint32_t elem_start = c * kMaxElems;
+                          uint32_t elems_this = std::min(kMaxElems, p.num_elements - elem_start);
+                          VkDeviceSize byte_off = VkDeviceSize(elem_start) * sizeof(float);
+                          VkDeviceSize byte_range = VkDeviceSize(elems_this) * sizeof(float);
+
+                          std::vector<VkDescriptorBufferInfo> bufInfos = {
+                              {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(grad_id)),
+                               byte_off, byte_range},                        // binding 0: grad
+                              {opt.zero_buf.handle, byte_off, byte_range},   // binding 1: recalled_grad
+                              {p.s_bar.handle, byte_off, byte_range},        // binding 2: s_bar
+                              {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(p.weight_id)),
+                               byte_off, byte_range},                        // binding 3: W
+                              {opt.delta_buf.handle, byte_off, byte_range},  // binding 4: delta
+                          };
+
+                          VkDescriptorSet descSet = ctx.cache.allocDescriptorSet(
+                              "surprise-momentum", bufInfos);
+
+                          SMPush push = {
+                              elems_this,
+                              opt.eta_base,
+                              opt.alpha_momentum,
+                              opt.lambda_recall,
+                              opt.surprise_floor,
+                              opt.weight_decay,
+                              opt.clip_max,
+                              1u
+                          };
+
+                          uint32_t gx = (elems_this + 255) / 256;
+                          ctx.batch.dispatch(pipe.pipeline, pipe.layout, descSet,
+                                             gx, 1, 1, &push, sizeof(push));
+                      }
+                  }
+
+                  ctx.batch.submit();
+
+              }
+
               tape.end();
 
               return loss;
           },
           py::arg("device"), py::arg("tape"),
           py::arg("model"), py::arg("vsa_state"), py::arg("true_delta"),
-          "Run one VSA training step: forward + loss + backward. Returns loss value.");
+          py::arg("optimizer") = py::none(),
+          "Run one VSA training step: forward + loss + backward + optimizer. Returns loss value.");
+
+    // ── GPU STDP Update ─────────────────────────────────────────────────
+    //
+    // Dispatches synapsis-stdp-update.glsl on GPU:
+    //   dW[post][pre] = lr * post_trace[post] * pre_trace[pre]
+    //   W[post][pre] = clamp(W + dW, w_min, w_max)
+    //
+    // The weight buffer is persistent (allocated once, reused across steps).
+    // Pre/post traces are uploaded as temporaries.
+
+    // StdpWeights: persistent GPU weight matrix with mapped pointer for norm readback
+    struct StdpWeights {
+        grilly::GrillyBuffer buf;
+        uint32_t dim;
+    };
+
+    py::class_<StdpWeights>(m, "StdpWeights")
+        .def(py::init([](GrillyCoreContext& ctx, uint32_t dim) {
+            StdpWeights sw;
+            sw.dim = dim;
+            size_t bytes = size_t(dim) * dim * sizeof(float);
+            sw.buf = ctx.pool.acquire(bytes);
+            std::memset(sw.buf.mappedPtr, 0, bytes);
+            return sw;
+        }), py::arg("device"), py::arg("dim"),
+        "Allocate a zero-initialized dim x dim STDP weight matrix on GPU.")
+        .def_readonly("dim", &StdpWeights::dim)
+        .def("norm", [](const StdpWeights& sw) -> float {
+            // Sampled Frobenius norm via persistent mapping
+            auto* ptr = static_cast<const float*>(sw.buf.mappedPtr);
+            size_t n = size_t(sw.dim) * sw.dim;
+            size_t stride = std::max(size_t(1), n / 1024);
+            double sample_sq = 0.0;
+            size_t count = 0;
+            for (size_t i = 0; i < n; i += stride) {
+                double v = ptr[i];
+                sample_sq += v * v;
+                count++;
+            }
+            return static_cast<float>(std::sqrt(sample_sq * (double(n) / double(count))));
+        }, "Approximate Frobenius norm (sampled every ~1024th element).");
+
+    m.def("stdp_update_gpu",
+          [](GrillyCoreContext& ctx,
+             StdpWeights& sw,
+             py::array_t<float> pre_trace_np,
+             py::array_t<float> post_trace_np,
+             float lr,
+             float weight_min,
+             float weight_max,
+             float decay) {
+              auto pre_buf = pre_trace_np.request();
+              auto post_buf = post_trace_np.request();
+
+              size_t trace_bytes = sw.dim * sizeof(float);
+              size_t w_bytes = size_t(sw.dim) * sw.dim * sizeof(float);
+
+              // Upload traces as temporaries
+              grilly::GrillyBuffer pre_gpu = ctx.pool.acquire(trace_bytes);
+              ctx.pool.upload(pre_gpu, static_cast<const float*>(pre_buf.ptr), trace_bytes);
+
+              grilly::GrillyBuffer post_gpu = ctx.pool.acquire(trace_bytes);
+              ctx.pool.upload(post_gpu, static_cast<const float*>(post_buf.ptr), trace_bytes);
+
+              grilly::PipelineEntry pipe = ctx.cache.getOrCreate(
+                  "synapsis-stdp-update", 3, 7 * sizeof(uint32_t));
+
+              std::vector<VkDescriptorBufferInfo> bufInfos = {
+                  {pre_gpu.handle, 0, trace_bytes},
+                  {post_gpu.handle, 0, trace_bytes},
+                  {sw.buf.handle, 0, w_bytes},
+              };
+
+              VkDescriptorSet descSet = ctx.cache.allocDescriptorSet(
+                  "synapsis-stdp-update", bufInfos);
+
+              struct {
+                  uint32_t batch_size;
+                  uint32_t in_features;
+                  uint32_t out_features;
+                  float lr;
+                  float weight_min;
+                  float weight_max;
+                  float decay;
+              } push = {1, sw.dim, sw.dim, lr, weight_min, weight_max, decay};
+
+              uint32_t gx = (sw.dim + 15) / 16;
+              uint32_t gy = (sw.dim + 15) / 16;
+
+              ctx.batch.begin();
+              ctx.batch.dispatch(pipe.pipeline, pipe.layout, descSet,
+                                 gx, gy, 1, &push, sizeof(push));
+              ctx.batch.submit();
+
+              ctx.pool.release(pre_gpu);
+              ctx.pool.release(post_gpu);
+          },
+          py::arg("device"), py::arg("weights"),
+          py::arg("pre_trace"), py::arg("post_trace"),
+          py::arg("lr") = 0.0001f,
+          py::arg("weight_min") = -1.0f, py::arg("weight_max") = 1.0f,
+          py::arg("decay") = 0.999f,
+          "GPU Hebbian weight update: W = decay*W + lr*post*pre^T, clamped to [w_min, w_max].");
 
     // ── Temporal: TemporalEncoder + CounterfactualReasoner ────────────────
 

@@ -135,6 +135,74 @@ Grilly-Next & Bitpacked VSA & 98.6\% & 2.09 & 5.4 GB \\
 \end{center}
 \end{table}
 
+\subsection*{6.3 VSA Hypernetwork Training (CubeMind Next-State Prediction)}
+
+We trained the VSAHypernetwork $H_\theta$ on 482,916 encoded states (10 semantic realms) with 476,736 transition pairs derived from combined conversational and instructional corpora. Training used the surrogate dot-product loss $\mathcal{L}_{VSA}$ with $K=16$ branches, OSGM-style hypergradient learning rate adaptation, and batched Hebbian weight updates.
+
+\begin{table}[h]
+\begin{center}
+\captionsetup{labelformat=empty}
+\caption{6.3a Training Progression (AMD RX 6750 XT, 10K steps)}
+\begin{tabular}{|l|l|l|l|l|}
+\hline
+Step & Loss & LR (OSGM) & Hebbian $\|\mathbf{W}_H\|$ & Phase \\
+\hline
+500 & 0.0862 & 0.100 & 3.33 & Phase 1 ($\leq$8 tokens) \\
+\hline
+1,000 & 0.0473 & 0.081 & 5.89 & Phase 2 ($\leq$15 tokens) \\
+\hline
+3,000 & 0.0442 & 0.009 & 17.89 & Phase 3 (all) \\
+\hline
+5,000 & 0.0430 & 0.057 & 28.84 & Phase 3 \\
+\hline
+10,000 & \textbf{0.0414} & 0.088 & 27.89 & Phase 3 \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\noindent\textbf{Key training findings:}
+\begin{itemize}
+\item \textbf{Full-parameter training}: Unfreezing all 6 weight matrices (including the UnpackProject $\mathbf{W}_{proj}$, $\mathbf{b}_{proj}$) broke through a loss plateau at 0.048, achieving 0.0414 final loss---a 14\% relative improvement over 4-parameter training.
+\item \textbf{Hypergradient adaptation}: The OSGM-style LR controller (arXiv:2502.11229) prevented LR collapse (observed at $10^{-6}$ without rate limiting) while allowing the optimizer to self-schedule across curriculum phases.
+\item \textbf{Curriculum phasing}: Three-phase curriculum (simple $\to$ medium $\to$ full complexity) provided stable learning progression without catastrophic forgetting.
+\end{itemize}
+
+\begin{table}[h]
+\begin{center}
+\captionsetup{labelformat=empty}
+\caption{6.3b Inference Quality (2,000 held-out transition pairs)}
+\begin{tabular}{|l|l|}
+\hline
+Metric & Value \\
+\hline
+Best-of-16 Hamming similarity & $0.840 \pm 0.021$ \\
+\hline
+Top-1 (single branch) similarity & $0.502 \pm 0.005$ \\
+\hline
+Best-of-K lift & $+0.339$ \\
+\hline
+Random baseline & 0.500 \\
+\hline
+Samples $\geq 0.80$ similarity & 98.0\% \\
+\hline
+Phase 1 (simple) similarity & $0.849 \pm 0.019$ \\
+\hline
+Phase 3 (complex) similarity & $0.838 \pm 0.020$ \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\noindent\textbf{Inference analysis:} The hypernetwork achieves 84\% normalized Hamming similarity on next-state prediction, well above the random baseline of 50\%. However, two architectural limitations emerged:
+
+\begin{enumerate}
+\item \textbf{Branch collapse}: Of the $K=16$ branches, only branch 1 learns meaningful predictions (0.84 similarity); the remaining 15 branches produce near-random outputs ($\approx$0.50). The winner-take-all loss gradient routing concentrates all learning signal into a single branch, defeating the many-worlds diversity objective. A load-balancing auxiliary loss or branch dropout is needed.
+\item \textbf{Near-identity prediction}: Multi-step autoregressive generation shows minimal state drift (Hamming distance from seed $<$ 0.005 per step). The model achieves high similarity by predicting small perturbations that barely alter the input state, rather than learning the true semantic transition structure. This suggests the surrogate loss rewards conservative predictions; a margin-scaled or contrastive loss formulation may encourage bolder transitions.
+\end{enumerate}
+
+\noindent\textbf{Hippocampal consolidation}: The offline dream cycle (Section 5.2) extracted 0 generalized rules across 10,000 training steps. At $D=10240$, exact-match XOR delta frequency counting is computationally infeasible---the probability of two random 10240-bit deltas matching exactly is $\approx 2^{-10240}$. A locality-sensitive clustering approach over approximate delta similarity is required to make dream consolidation functional at scale.
+
 \section*{7. Conclusion}
 Grilly-Next demonstrates that LLM scaling can bypass the "Embeddings Wall." By shifting from continuous stochastic prediction to hardware-verified geometric state estimation, we achieve deterministic logical grounding. The combination of VSA Binding, Many-Worlds Hypernetworks, and Vulkan Pruning provides a robust path toward high-efficiency, zerohallucination computational agents.
 

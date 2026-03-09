@@ -22,6 +22,7 @@ struct GrillyBuffer {
     size_t size = 0;         ///< Requested size
     size_t bucketSize = 0;   ///< Rounded-up power-of-2 allocation size
     void* mappedPtr = nullptr;  ///< Persistent CPU-visible mapping
+    uint64_t deviceAddress = 0; ///< BDA 64-bit GPU virtual pointer (0 if BDA not enabled)
 };
 
 /// VMA-backed buffer pool with power-of-2 bucket reuse.
@@ -63,6 +64,12 @@ public:
 
     /// Upload CPU data into a buffer via persistent mapping.
     void upload(GrillyBuffer& buf, const float* data, size_t bytes);
+
+    /// Upload CPU data at an offset within a buffer via persistent mapping.
+    /// Used for incremental GPU sync (e.g., appending a single cache entry
+    /// without re-uploading the entire buffer).
+    void uploadPartial(GrillyBuffer& buf, const void* data,
+                       size_t offset, size_t bytes);
 
     /// Upload CPU data into a device-local buffer via staging buffer.
     /// Allocates a temporary host-visible staging buffer, copies data in,

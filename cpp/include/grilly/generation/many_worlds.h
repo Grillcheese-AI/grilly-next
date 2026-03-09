@@ -9,6 +9,9 @@
 #include "grilly/pipeline_cache.h"
 
 namespace grilly {
+namespace cubemind {
+    class ResonatorNetwork;
+}
 namespace generation {
 
 /// Result of evaluating K counterfactual futures against WorldModel constraints.
@@ -67,6 +70,14 @@ ManyWorldsResult evaluate_many_worlds(
     uint32_t K,
     uint32_t D,
     cognitive::WorldModel& world_model);
+
+/// Interpret the best trajectory from many-worlds via resonator unbinding.
+/// Returns (word, similarity) for a specific (role, position) slot.
+std::pair<std::string, float> interpret_trajectory(
+    const ManyWorldsResult& mw_result,
+    grilly::cubemind::ResonatorNetwork& resonator,
+    const std::string& dep_role,
+    uint32_t position);
 
 }  // namespace generation
 }  // namespace grilly

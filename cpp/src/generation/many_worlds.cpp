@@ -1,7 +1,10 @@
 #include "grilly/generation/many_worlds.h"
+#include "grilly/cubemind/resonator.h"
+#include "grilly/cubemind/types.h"
 
 #include <algorithm>
 #include <cstring>
+#include <vulkan/vulkan.h>
 
 namespace grilly {
 namespace generation {
@@ -34,123 +37,118 @@ ManyWorldsResult evaluate_many_worlds(
     uint32_t D,
     cognitive::WorldModel& world_model) {
 
-    uint32_t words_per_vec = (D + 31) / 32;
-    uint32_t num_constraints = world_model.constraint_count();
-
-    // 1. CPU: Snap continuous pre-activations to bitpacked deltas
-    std::vector<uint32_t> snapped_deltas =
-        snap_to_bipolar(continuous_deltas, K, D);
-
     ManyWorldsResult result;
     result.K = K;
-    result.words_per_vec = words_per_vec;
+    result.words_per_vec = (D + 31) / 32;
     result.violation_counts.resize(K, 0);
+    result.future_states.resize(K * result.words_per_vec, 0);
 
-    // If no constraints loaded, all trajectories are coherent
-    if (num_constraints == 0) {
-        // Compute future states on CPU (just XOR, practically instant)
-        result.future_states.resize(K * words_per_vec);
-        for (uint32_t k = 0; k < K; ++k) {
-            for (uint32_t w = 0; w < words_per_vec; ++w) {
-                result.future_states[k * words_per_vec + w] =
-                    current_state[w] ^
-                    snapped_deltas[k * words_per_vec + w];
-            }
+    // Always compute future states: S_{t+1} = S_t XOR Delta_k
+    std::vector<uint32_t> packed_deltas = snap_to_bipolar(continuous_deltas, K, D);
+    for (uint32_t k = 0; k < K; ++k) {
+        for (uint32_t j = 0; j < result.words_per_vec; ++j) {
+            result.future_states[k * result.words_per_vec + j] =
+                current_state[j] ^ packed_deltas[k * result.words_per_vec + j];
         }
+    }
+
+    if (world_model.constraint_count() == 0) {
+        // Degenerate case: no constraints, all branches equally coherent
         result.best_k = 0;
         return result;
     }
 
-    // 2. Vulkan resource allocation
-    size_t state_bytes = words_per_vec * sizeof(uint32_t);
-    size_t deltas_bytes = K * words_per_vec * sizeof(uint32_t);
-    size_t scores_bytes = K * sizeof(uint32_t);
+    uint32_t C = world_model.constraint_count();
+
+    // packed_deltas already computed above (for future states)
+
+    // 2. Prepare buffers
+    size_t state_bytes = result.words_per_vec * sizeof(uint32_t);
+    size_t deltas_bytes = packed_deltas.size() * sizeof(uint32_t);
+    size_t scores_bytes = K * sizeof(uint32_t); // 1 uint32 per trajectory (violations)
 
     GrillyBuffer buf_state = pool.acquire(state_bytes);
     GrillyBuffer buf_deltas = pool.acquire(deltas_bytes);
     GrillyBuffer buf_scores = pool.acquire(scores_bytes);
 
-    // upload/download take float* — reinterpret_cast is safe since both
-    // types are 4 bytes and we're just doing memcpy underneath.
-    pool.upload(buf_state,
-                reinterpret_cast<const float*>(current_state), state_bytes);
-    pool.upload(buf_deltas,
-                reinterpret_cast<const float*>(snapped_deltas.data()),
-                deltas_bytes);
-
-    // Zero-initialize scores buffer
+    // Ensure scores are zeroed
     std::vector<uint32_t> zero_scores(K, 0);
-    pool.upload(buf_scores,
-                reinterpret_cast<const float*>(zero_scores.data()),
-                scores_bytes);
+    pool.upload(buf_scores, reinterpret_cast<const float*>(zero_scores.data()), scores_bytes);
 
-    // Get the WorldModel constraints GPU buffer directly (no re-upload)
-    GrillyBuffer& buf_constraints = world_model.constraints_gpu_buffer();
-    size_t constraints_bytes =
-        size_t(num_constraints) * words_per_vec * sizeof(uint32_t);
+    // 3. Upload data
+    pool.upload(buf_state, reinterpret_cast<const float*>(current_state), state_bytes);
+    pool.upload(buf_deltas, reinterpret_cast<const float*>(packed_deltas.data()), deltas_bytes);
+    
+    // We assume world_model already holds its packed constraints in a GPU buffer
+    GrillyBuffer buf_constraints = world_model.constraints_gpu_buffer();
 
-    // 3. Pipeline & descriptor setup
-    // 4 bindings, 12 bytes push constants (3 x uint32)
-    PipelineEntry pipe =
-        cache.getOrCreate("many-worlds-coherence", 4, 12);
+    // 4. Get Shader Pipeline
+    // many-worlds-coherence.glsl: 
+    //   Workgroup size: e.g., 256
+    //   Desciptor set: 
+    //     binding 0: current_state
+    //     binding 1: deltas (array of K)
+    //     binding 2: constraints (array of C)
+    //     binding 3: out_violation_counts (array of K)
+    
+    PipelineEntry pipe = cache.getOrCreate("many-worlds-coherence", 4, sizeof(uint32_t) * 4);
 
     std::vector<VkDescriptorBufferInfo> bufInfos = {
         {buf_state.handle, 0, state_bytes},
         {buf_deltas.handle, 0, deltas_bytes},
-        {buf_constraints.handle, 0, constraints_bytes},
-        {buf_scores.handle, 0, scores_bytes}};
+        {buf_constraints.handle, 0, C * state_bytes},
+        {buf_scores.handle, 0, scores_bytes}
+    };
 
-    VkDescriptorSet descSet =
-        cache.allocDescriptorSet("many-worlds-coherence", bufInfos);
+    VkDescriptorSet descSet = cache.allocDescriptorSet("many-worlds-coherence", bufInfos);
 
-    // Push constants: words_per_vec, num_constraints, distance_thresh
-    // 45% Hamming distance threshold — futures closer than this to a
-    // constraint are violations (they "look like" a known falsehood).
-    struct {
-        uint32_t words_per_vec;
-        uint32_t num_constraints;
-        uint32_t distance_thresh;
-    } pushData = {words_per_vec, num_constraints,
-                  static_cast<uint32_t>(D * 0.45f)};
+    uint32_t push[4] = {K, result.words_per_vec, C, 0};
 
-    // 4. Dispatch: K workgroups, 320 threads each
     batch.begin();
-    batch.dispatch(pipe.pipeline, pipe.layout, descSet, K, 1, 1,
-                   &pushData, sizeof(pushData));
+    batch.dispatch(pipe.pipeline, pipe.layout, descSet, K, 1, 1, push, sizeof(push));
     batch.submit();
 
-    // 5. Readback scores
-    pool.download(buf_scores,
-                  reinterpret_cast<float*>(result.violation_counts.data()),
-                  scores_bytes);
+    // 5. Readback violation counts
+    std::vector<uint32_t> scores(K);
+    pool.download(buf_scores, reinterpret_cast<float*>(scores.data()), scores_bytes);
+    result.violation_counts = scores;
 
-    // 6. Compute future states on CPU (XOR is trivial)
-    result.future_states.resize(K * words_per_vec);
-    for (uint32_t k = 0; k < K; ++k) {
-        for (uint32_t w = 0; w < words_per_vec; ++w) {
-            result.future_states[k * words_per_vec + w] =
-                current_state[w] ^
-                snapped_deltas[k * words_per_vec + w];
-        }
-    }
+    // future_states already computed above (before constraint check)
 
-    // 7. Find best trajectory (fewest violations)
+    // 6. Find best trajectory (fewest violations, ties broken by lowest k)
     result.best_k = 0;
-    uint32_t min_violations = result.violation_counts[0];
+    uint32_t best_violations = result.violation_counts[0];
     for (uint32_t k = 1; k < K; ++k) {
-        if (result.violation_counts[k] < min_violations) {
-            min_violations = result.violation_counts[k];
+        if (result.violation_counts[k] < best_violations) {
+            best_violations = result.violation_counts[k];
             result.best_k = k;
         }
     }
 
-    // 8. Cleanup
     pool.release(buf_state);
     pool.release(buf_deltas);
     pool.release(buf_scores);
-    // buf_constraints is owned by WorldModel — do NOT release
 
     return result;
+}
+
+std::pair<std::string, float> interpret_trajectory(
+    const ManyWorldsResult& mw_result,
+    grilly::cubemind::ResonatorNetwork& resonator,
+    const std::string& dep_role,
+    uint32_t position) {
+
+    uint32_t best_k = mw_result.best_k;
+    uint32_t words_per_vec = mw_result.words_per_vec;
+
+    grilly::cubemind::BitpackedVec bundle;
+    bundle.dim = words_per_vec * 32;
+    bundle.data.assign(
+        mw_result.future_states.begin() + best_k * words_per_vec,
+        mw_result.future_states.begin() + (best_k + 1) * words_per_vec
+    );
+
+    return resonator.query_slot(bundle, dep_role, position);
 }
 
 }  // namespace generation

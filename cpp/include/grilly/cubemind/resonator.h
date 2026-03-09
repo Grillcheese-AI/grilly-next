@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,14 @@ public:
     void load_codebook_bipolar(const std::vector<std::string>& words,
                                 const int8_t* bipolar_vectors);
 
+    /// Save codebook to a binary file for checkpointing.
+    /// Format: [magic=0x47524C59][version=1][count][dim]
+    ///         then per entry: [word_len][word_bytes][bitpacked_vector]
+    void save_codebook(const std::string& path) const;
+
+    /// Load codebook from a binary checkpoint file and upload to VRAM.
+    void load_codebook_file(const std::string& path);
+
     /// Number of words in the codebook.
     size_t codebook_size() const { return words_.size(); }
 
@@ -122,6 +131,53 @@ public:
         uint32_t length,
         bool explain_away = true);
 
+    /// Unbind a single role from a bundle and resonate against codebook.
+    /// This is the VSA equivalent of a key→value lookup in a hash table.
+    ///
+    ///   query = bundle ⊗ role_vec
+    ///         = (filler₁⊗role₁ + filler₂⊗role₂ + ...) ⊗ roleᵢ
+    ///         = fillerᵢ + noise   (because roleᵢ⊗roleᵢ = identity)
+    ///
+    /// @param bundle     Bitpacked superposition of bound role-filler pairs
+    /// @param role_key   The role to unbind (e.g., "currency", "nsubj")
+    /// @param key_prefix Prefix used during encoding (e.g., "role_")
+    /// @return (word, similarity) of the best codebook match
+    std::pair<std::string, float> query_role(
+        const BitpackedVec& bundle,
+        const std::string& role_key,
+        const std::string& key_prefix);
+
+    /// Query a specific (role, position) slot from a sentence bundle.
+    std::pair<std::string, float> query_slot(
+        const BitpackedVec& bundle,
+        const std::string& dep_role,
+        uint32_t position);
+
+    /// Compute the analogical mapping between two bundles.
+    /// mapping = bind(inverse(source), target)
+    ///         = source XOR target  (since XOR is self-inverse in bipolar)
+    ///
+    /// Then: bind(mapping, source_filler) ≈ target_filler
+    BitpackedVec compute_analogy_map(
+        const BitpackedVec& source_bundle,
+        const BitpackedVec& target_bundle);
+
+    /// Apply an analogical mapping to a query filler.
+    /// "If USD maps to X in the target frame, what is X?"
+    std::pair<std::string, float> apply_analogy(
+        const BitpackedVec& analogy_map,
+        const BitpackedVec& query_filler);
+
+    /// Unbind N roles simultaneously on GPU, then batch-resonate.
+    /// Much faster than sequential unbind+resonate for long sentences.
+    std::vector<std::pair<std::string, float>> batch_unbind(
+        const BitpackedVec& bundle,
+        const std::vector<std::string>& role_keys,
+        const std::vector<uint32_t>& positions);
+
+
+
+
     // ── Stats ────────────────────────────────────────────────────────
 
     uint64_t total_resonations() const { return total_resonations_; }
@@ -148,6 +204,36 @@ private:
     void dispatch_resonator(const uint32_t* query_packed,
                              float* similarities_out);
 };
+
+// ── Hyper-NAR Decoding Loop ─────────────────────────────────────────
+//
+// Non-autoregressive generation via VSA geometric trajectories.
+// Takes a fused multimodal state and iteratively:
+//   1. Predicts a structural transition vector (hypernetwork)
+//   2. Applies the transition via VSA binding (XOR)
+//   3. Resonates the result against the codebook (GPU Hamming search)
+//   4. Emits the decoded word
+//
+// Complexity per token: O(1) MLP + O(1) XOR + O(N) Hamming search
+// No quadratic attention. No context window scaling.
+
+/// Callback type for the hypernetwork forward pass.
+/// Takes the current bitpacked state and returns a bipolar transformation vector.
+using HypernetworkPredictor = std::function<std::vector<int8_t>(
+    const BitpackedVec& current_state)>;
+
+/// Execute the Hyper-NAR decoding loop.
+///
+/// @param fused_prompt_state  Initial state (fused multimodal or text-only)
+/// @param resonator           ResonatorNetwork with loaded codebook
+/// @param predictor           Hypernetwork forward pass callback
+/// @param max_tokens          Maximum tokens to generate
+/// @return Vector of decoded words
+std::vector<std::string> hyper_nar_decode(
+    const BitpackedVec& fused_prompt_state,
+    ResonatorNetwork& resonator,
+    HypernetworkPredictor predictor,
+    uint32_t max_tokens = 50);
 
 }  // namespace cubemind
 }  // namespace grilly

@@ -1,14 +1,12 @@
 #version 450
 
-// VSA Surrogate Loss — Backward Pass (Sparse Gradient Routing)
+// VSA Surrogate Loss — Backward Pass (All-K Weighted Gradient Routing)
 //
-// Only writes gradients to winning_k and runner_up_k branches.
-// Other K-2 branches receive exactly 0.0 gradient.
+// Routes hinge gradients to ALL K branches, weighted by softmax(dots/temp).
+// This prevents branch collapse: every branch receives gradient proportional
+// to its contribution, encouraging all branches to learn.
 //
-// Winner gradient:     grad[win_k, i] = (-y_true / D) * scale   where hinge active
-// Runner-up gradient:  grad[run_k, i] = (+y_true / D) * lambda  where contrastive active
-//
-// Cost: O(2D) instead of O(K*D)
+// Contrastive gradient still only applies to runner-up (unchanged).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -22,7 +20,7 @@ layout(set = 0, binding = 1) readonly buffer TrueDelta {
     uint true_delta[];
 };
 
-// Gradient w.r.t. predictions: (batch, K, D) — output, zeroed before dispatch
+// Gradient w.r.t. predictions: (batch, K, D) — output
 layout(set = 0, binding = 2) buffer GradPredictions {
     float grad_preds[];
 };
@@ -30,6 +28,11 @@ layout(set = 0, binding = 2) buffer GradPredictions {
 // Results from forward: [winning_k, runner_up_k, dot_win, dot_run] per batch
 layout(set = 0, binding = 3) readonly buffer Results {
     uint results[];
+};
+
+// Branch weights from forward: softmax(dots/temperature), (batch, K) floats
+layout(set = 0, binding = 4) readonly buffer BranchWeights {
+    float branch_weights[];
 };
 
 layout(push_constant) uniform PushConsts {
@@ -40,7 +43,8 @@ layout(push_constant) uniform PushConsts {
     float gamma;
     float delta_margin;
     float lambda_c;
-    float grad_scale;    // Global gradient scale (e.g., 1/batch_size)
+    float grad_scale;
+    float temperature;
 };
 
 void main() {
@@ -59,14 +63,15 @@ void main() {
 
     float inv_D = 1.0 / float(D);
 
-    // Winner: hinge gradient
-    {
-        uint pred_idx = (batch_idx * K + win_k) * D + tid;
+    // All-K hinge gradient: each branch gets gradient weighted by its softmax weight
+    for (uint k = 0; k < K; ++k) {
+        uint pred_idx = (batch_idx * K + k) * D + tid;
         float z_pred = preds[pred_idx];
         float margin = gamma - y_true * z_pred;
 
         if (margin > 0.0) {
-            grad_preds[pred_idx] += (-y_true * inv_D) * grad_scale;
+            float w_k = branch_weights[batch_idx * K + k];
+            grad_preds[pred_idx] += (-y_true * inv_D) * w_k * grad_scale;
         }
     }
 

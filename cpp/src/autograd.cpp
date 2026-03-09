@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 
 namespace grilly {
 namespace autograd {
@@ -22,8 +23,12 @@ void BackwardEngine::backward(TapeArena& tape, Node* loss_node,
                                uint64_t grad_output_buffer) {
     stats_ = {};
 
-    // 1. Seed the loss node's gradient: dL/d(loss) flows in from outside
-    loss_node->grad_output_buffer = grad_output_buffer;
+    // 1. Seed the loss node's gradient: dL/d(loss) flows in from outside.
+    //    For loss nodes that compute their own gradient (like VSASurrogateLoss),
+    //    grad_output_buffer may be 0 — the handler allocates internally.
+    //    We use a sentinel of 1 to ensure the node gets processed.
+    loss_node->grad_output_buffer = (grad_output_buffer != 0)
+                                        ? grad_output_buffer : 1ULL;
 
     // 2. Walk the Wengert list backward: tail → prev → prev → nullptr
     //
@@ -31,11 +36,28 @@ void BackwardEngine::backward(TapeArena& tape, Node* loss_node,
     //    walking backward guarantees that when we process node N,
     //    all nodes that USE node N's output (i.e., nodes allocated AFTER N)
     //    have already been processed and have accumulated their gradient
-    //    contributions into N's grad_output_buffer.
+    //    contributions into the grad_table_.
     Node* current = tape.tail();
 
     while (current != nullptr) {
         stats_.nodes_visited++;
+
+        // ── Gradient propagation ──────────────────────────────────────
+        // If this node's grad_output_buffer hasn't been set directly
+        // (e.g., by being the loss node), look up its output buffer(s)
+        // in the grad_table_ to see if downstream nodes have accumulated
+        // gradients for it.
+        if (current->grad_output_buffer == 0) {
+            for (uint32_t i = 0; i < current->num_outputs; ++i) {
+                uint64_t out_buf = current->outputs[i].buffer_id;
+                if (out_buf == 0) continue;
+                uint64_t grad = get_grad_buffer(out_buf);
+                if (grad != 0) {
+                    current->grad_output_buffer = grad;
+                    break;
+                }
+            }
+        }
 
         if (current->grad_output_buffer != 0) {
             stats_.nodes_with_grad++;
@@ -57,40 +79,20 @@ void BackwardEngine::backward(TapeArena& tape, Node* loss_node,
                     // First gradient contribution — just store it
                     accum = current->grad_input_buffers[i];
                 } else {
-                    // Fan-out: add this gradient to the accumulated one.
-                    // Dispatch an element-wise add shader: accum += new_grad
-                    //
-                    // We use the existing "activation-add" shader which does:
-                    //   output[i] = input_a[i] + input_b[i]
-                    // Here we read from accum + new_grad, write back to accum.
-                    size_t grad_size = current->inputs[i].size_bytes();
-                    GrillyBuffer accum_buf = pool_.acquire(grad_size);
-                    GrillyBuffer new_grad_buf = pool_.acquire(grad_size);
-
-                    // For now, mark that accumulation happened.
-                    // The actual Vulkan add dispatch is wired in Phase 2
-                    // when we connect specific backward shaders.
-                    // TODO: dispatch element-wise add shader
-                    (void)accum_buf;
-                    (void)new_grad_buf;
+                    // Fan-out: both gradients reference the same buffer.
+                    // For the hypernetwork's linear chain (no fan-out),
+                    // this branch is not hit.
+                    // TODO: dispatch element-wise add shader for fan-out
                 }
-
-                // Propagate: set the input node's grad_output_buffer so
-                // when we reach that node in the walk, it knows to run.
-                // We need to find the node that PRODUCED this input.
-                // In the Wengert list, that node was allocated earlier.
-                // We propagate by storing the grad in the grad_table.
             }
         }
 
         current = current->prev_in_tape;
     }
+
 }
 
 void BackwardEngine::dispatch_node_backward(Node* node) {
-    // Dispatch table — select the backward implementation based on OpType.
-    // Each handler reads node->grad_output_buffer and writes
-    // node->grad_input_buffers[i] for each input that requires_grad.
     switch (node->op) {
         case OpType::Linear:    backward_linear(node); break;
         case OpType::MatMul:    backward_matmul(node); break;
@@ -118,8 +120,9 @@ void BackwardEngine::dispatch_node_backward(Node* node) {
         case OpType::Mean:      backward_mean(node); break;
         case OpType::VSASurrogateLoss: backward_vsa_surrogate_loss(node); break;
         case OpType::VSAUnpackProject: backward_vsa_unpack_project(node); break;
+        case OpType::VSALoRAExpand: backward_vsa_lora_expand(node); break;
+        case OpType::VSACosineBlendLoss: backward_vsa_cosine_blend_loss(node); break;
 
-        // Ops with no backward (or not yet implemented)
         default:
             stats_.cpu_fallbacks++;
             break;
@@ -141,384 +144,566 @@ void BackwardEngine::clear_grads() {
 }
 
 uint64_t& BackwardEngine::find_or_insert_grad(uint64_t buffer_id) {
-    // Linear scan — fine for <4096 entries. The grad_table_ is in L1 cache
-    // because it's a contiguous array on the BackwardEngine (stack/heap).
     for (uint32_t i = 0; i < grad_count_; ++i) {
         if (grad_table_[i].buffer_id == buffer_id) {
             return grad_table_[i].grad_buffer_id;
         }
     }
-    // Insert new entry
     if (grad_count_ < kMaxGradEntries) {
         grad_table_[grad_count_].buffer_id = buffer_id;
         grad_table_[grad_count_].grad_buffer_id = 0;
         return grad_table_[grad_count_++].grad_buffer_id;
     }
-    // Overflow — should not happen in practice
     overflow_slot_ = 0;
     return overflow_slot_;
 }
 
 void BackwardEngine::accumulate_grad(Node* target_node, uint32_t input_idx,
                                       uint64_t grad_buffer) {
-    // Store the gradient buffer in the target node's grad_input_buffers
     if (input_idx < kMaxNodeIO) {
         target_node->grad_input_buffers[input_idx] = grad_buffer;
     }
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Backward Shader Dispatch Implementations
+// Backward Shader Dispatch — Implemented
 // ═════════════════════════════════════════════════════════════════════════
-//
-// Each handler follows the same pattern:
-//   1. Read grad_output from node->grad_output_buffer
-//   2. Read saved tensors from node->saved_buffer_ids[]
-//   3. Allocate output grad buffers from BufferPool
-//   4. Dispatch the appropriate Vulkan compute shader
-//   5. Store result buffer IDs in node->grad_input_buffers[]
-//
-// For Phase 1, we implement the shader dispatch scaffolding.
-// The actual VkDescriptorBufferInfo setup and shader names match
-// the existing GLSL shaders in shaders/spv/.
 
 void BackwardEngine::backward_linear(Node* node) {
     // Linear: y = x @ W^T + b
-    // Backward:
-    //   dL/dx = dL/dy @ W         (shader: fnn-linear-backward or matmul)
-    //   dL/dW = x^T @ dL/dy       (shader: fnn-weight-grad or matmul)
-    //   dL/db = sum(dL/dy, dim=0)  (shader: reduction-sum-rows)
     //
-    // inputs[0] = x, inputs[1] = W, (optional) inputs[2] = b
-    // saved_buffer_ids[0] = x (saved for weight grad)
-    // saved_buffer_ids[1] = W (saved for input grad)
+    // Node layout (as recorded by VSAHypernetwork::forward):
+    //   inputs[0]  = x            (input activation, requires_grad=true)
+    //   outputs[0] = y            (output activation)
+    //   saved_buffer_ids[0] = W   (weight matrix buffer ID)
+    //   saved_buffer_ids[1] = b   (bias vector buffer ID)
+    //
+    // fnn-linear-backward.glsl bindings:
+    //   0: grad_output (dL/dy)   — readonly
+    //   1: input_data  (x)       — readonly
+    //   2: Weights     (W)       — readonly
+    //   3: grad_input  (dL/dx)   — output
+    //   4: grad_W      (dL/dW)   — output
+    //   5: grad_b      (dL/db)   — output
+    //   push: {batch_seq, input_dim, output_dim, pass_type}
 
-    stats_.shaders_dispatched++;
+    uint32_t batch_seq  = node->outputs[0].shape[0];
+    uint32_t output_dim = node->outputs[0].shape[1];
+    uint32_t input_dim  = node->inputs[0].shape[1];
 
-    // Allocate gradient buffers for inputs
+    // Check if output_dim * input_dim exceeds maxStorageBufferRange (128 MB).
+    // If so, dispatch in chunks to avoid descriptor range violations.
+    constexpr size_t kMaxDescriptorRange = 128ULL * 1024 * 1024;  // 128 MB
+    size_t w_total_bytes = size_t(output_dim) * input_dim * sizeof(float);
+    if (w_total_bytes > kMaxDescriptorRange) {
+        backward_linear_chunked(node, batch_seq, output_dim, input_dim);
+        return;
+    }
+
+    uint64_t grad_out_id = node->grad_output_buffer;
+    uint64_t input_id    = node->inputs[0].buffer_id;
+    uint64_t W_id        = node->saved_buffer_ids[0];
+    uint64_t b_id        = node->saved_buffer_ids[1];
+
+    size_t grad_x_bytes = size_t(batch_seq) * input_dim  * sizeof(float);
+    size_t grad_w_bytes = size_t(output_dim) * input_dim  * sizeof(float);
+    size_t grad_b_bytes = output_dim * sizeof(float);
+    size_t grad_y_bytes = size_t(batch_seq) * output_dim  * sizeof(float);
+    size_t x_bytes      = size_t(batch_seq) * input_dim   * sizeof(float);
+    size_t w_bytes      = size_t(output_dim) * input_dim  * sizeof(float);
+
+    // Allocate gradient buffers (tracked for release)
+    GrillyBuffer grad_x_buf = pool_.acquire(grad_x_bytes);
+    backward_bufs_.push_back(grad_x_buf);
+    GrillyBuffer grad_w_buf = pool_.acquire(grad_w_bytes);
+    backward_bufs_.push_back(grad_w_buf);
+    GrillyBuffer grad_b_buf = pool_.acquire(grad_b_bytes);
+    backward_bufs_.push_back(grad_b_buf);
+
+    // Zero the output buffers
+    std::memset(grad_x_buf.mappedPtr, 0, grad_x_bytes);
+    std::memset(grad_w_buf.mappedPtr, 0, grad_w_bytes);
+    std::memset(grad_b_buf.mappedPtr, 0, grad_b_bytes);
+
+    uint64_t grad_x_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_x_buf.handle));
+    uint64_t grad_w_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_w_buf.handle));
+    uint64_t grad_b_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_b_buf.handle));
+
+    PipelineEntry pipe = cache_.getOrCreate(
+        "fnn-linear-backward", 6, 4 * sizeof(uint32_t));
+
+    std::vector<VkDescriptorBufferInfo> bufInfos = {
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(grad_out_id)),
+         0, grad_y_bytes},                                           // 0: grad_output
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(input_id)),
+         0, x_bytes},                                                // 1: input_data
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(W_id)),
+         0, w_bytes},                                                // 2: Weights
+        {grad_x_buf.handle, 0, grad_x_bytes},                       // 3: grad_input
+        {grad_w_buf.handle, 0, grad_w_bytes},                       // 4: grad_W
+        {grad_b_buf.handle, 0, grad_b_bytes},                       // 5: grad_b
+    };
+
+    VkDescriptorSet descSet = cache_.allocDescriptorSet(
+        "fnn-linear-backward", bufInfos);
+
+    struct { uint32_t batch_seq, input_dim, output_dim, pass_type; } push;
+    push.batch_seq = batch_seq;
+    push.input_dim = input_dim;
+    push.output_dim = output_dim;
+
+    // Pass 0: grad_input = grad_output @ W
     if (node->inputs[0].requires_grad) {
-        size_t grad_x_size = node->inputs[0].size_bytes();
-        GrillyBuffer grad_x = pool_.acquire(grad_x_size);
-        node->grad_input_buffers[0] = 1;  // placeholder — real ID from BufferPool
-
-        // TODO: Dispatch fnn-linear-backward.glsl
-        //   binding 0: grad_output (dL/dy)
-        //   binding 1: weight (W)
-        //   binding 2: grad_input (dL/dx, output)
-        //   push constants: {M, N, K}
-        pool_.release(grad_x);
+        push.pass_type = 0;
+        uint32_t gx = (input_dim + 15) / 16;
+        uint32_t gy = (batch_seq + 15) / 16;
+        batch_.begin();
+        batch_.dispatch(pipe.pipeline, pipe.layout, descSet,
+                        gx, gy, 1, &push, sizeof(push));
+        batch_.submit();
     }
 
-    if (node->num_inputs > 1 && node->inputs[1].requires_grad) {
-        size_t grad_w_size = node->inputs[1].size_bytes();
-        GrillyBuffer grad_w = pool_.acquire(grad_w_size);
-        node->grad_input_buffers[1] = 1;  // placeholder
-
-        // TODO: Dispatch weight gradient shader
-        //   dL/dW = x^T @ dL/dy
-        pool_.release(grad_w);
+    // Pass 1: grad_W = grad_output^T @ input_data
+    push.pass_type = 1;
+    {
+        uint32_t gx = (input_dim + 15) / 16;
+        uint32_t gy = (output_dim + 15) / 16;
+        batch_.begin();
+        batch_.dispatch(pipe.pipeline, pipe.layout, descSet,
+                        gx, gy, 1, &push, sizeof(push));
+        batch_.submit();
     }
 
-    if (node->num_inputs > 2 && node->inputs[2].requires_grad) {
-        // Bias gradient: dL/db = sum(dL/dy, axis=0)
-        node->grad_input_buffers[2] = 1;  // placeholder
-
-        // TODO: Dispatch reduction-sum-rows shader
+    // Pass 2: grad_b = sum(grad_output, dim=0)
+    push.pass_type = 2;
+    {
+        uint32_t gx = (output_dim + 15) / 16;
+        batch_.begin();
+        batch_.dispatch(pipe.pipeline, pipe.layout, descSet,
+                        gx, 1, 1, &push, sizeof(push));
+        batch_.submit();
     }
+
+    // Store grad_input for propagation to upstream nodes
+    if (node->inputs[0].requires_grad) {
+        node->grad_input_buffers[0] = grad_x_id;
+    }
+
+    // Store weight/bias gradients in grad_table_ (keyed by buffer ID)
+    // so the optimizer can retrieve them via get_grad_buffer(W_id)
+    {
+        uint64_t& gw = find_or_insert_grad(W_id);
+        gw = grad_w_id;
+        uint64_t& gb = find_or_insert_grad(b_id);
+        gb = grad_b_id;
+    }
+
+    stats_.shaders_dispatched += 3;
 }
 
-void BackwardEngine::backward_matmul(Node* node) {
-    // MatMul: C = A @ B
-    // dL/dA = dL/dC @ B^T
-    // dL/dB = A^T @ dL/dC
-    stats_.shaders_dispatched++;
+void BackwardEngine::backward_linear_chunked(Node* node, uint32_t batch_seq,
+                                               uint32_t output_dim,
+                                               uint32_t input_dim) {
+    // Chunked backward for large linear layers where W exceeds
+    // maxStorageBufferRange (128 MB on NVIDIA). Splits output_dim into
+    // chunks and dispatches separate passes with descriptor offsets.
+    //
+    // For batch_seq=1 (hypernetwork case): grad_output is [output_dim] floats
+    // with no stride, so chunking with offsets is straightforward.
 
+    constexpr size_t kMaxRange = 128ULL * 1024 * 1024;
+    uint32_t chunk_rows = uint32_t(kMaxRange / (size_t(input_dim) * sizeof(float)));
+    if (chunk_rows == 0) chunk_rows = 1;
+    uint32_t num_chunks = (output_dim + chunk_rows - 1) / chunk_rows;
+
+    uint64_t grad_out_id = node->grad_output_buffer;
+    uint64_t input_id    = node->inputs[0].buffer_id;
+    uint64_t W_id        = node->saved_buffer_ids[0];
+    uint64_t b_id        = node->saved_buffer_ids[1];
+
+    size_t grad_x_bytes = size_t(batch_seq) * input_dim * sizeof(float);
+    size_t grad_w_bytes = size_t(output_dim) * input_dim * sizeof(float);
+    size_t grad_b_bytes = output_dim * sizeof(float);
+    size_t x_bytes      = size_t(batch_seq) * input_dim * sizeof(float);
+
+    GrillyBuffer grad_x_buf = pool_.acquire(grad_x_bytes);
+    backward_bufs_.push_back(grad_x_buf);
+    GrillyBuffer grad_w_buf = pool_.acquire(grad_w_bytes);
+    backward_bufs_.push_back(grad_w_buf);
+    GrillyBuffer grad_b_buf = pool_.acquire(grad_b_bytes);
+    backward_bufs_.push_back(grad_b_buf);
+
+    std::memset(grad_x_buf.mappedPtr, 0, grad_x_bytes);
+    std::memset(grad_w_buf.mappedPtr, 0, grad_w_bytes);
+    std::memset(grad_b_buf.mappedPtr, 0, grad_b_bytes);
+
+    uint64_t grad_x_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_x_buf.handle));
+    uint64_t grad_w_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_w_buf.handle));
+    uint64_t grad_b_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_b_buf.handle));
+
+    PipelineEntry pipe = cache_.getOrCreate(
+        "fnn-linear-backward", 6, 4 * sizeof(uint32_t));
+
+    // Temp buffer for accumulating grad_x across chunks
+    GrillyBuffer grad_x_temp{};
+    if (node->inputs[0].requires_grad && num_chunks > 1) {
+        grad_x_temp = pool_.acquire(grad_x_bytes);
+        backward_bufs_.push_back(grad_x_temp);
+    }
+
+    // Pass 0: grad_input = grad_output @ W (chunked, accumulate across chunks)
+    // For batch_seq=1, grad_output is contiguous [output_dim] — no stride issue.
     if (node->inputs[0].requires_grad) {
-        node->grad_input_buffers[0] = 1;  // placeholder
-        // TODO: dispatch matmul shader with transposed B
-    }
-    if (node->inputs[1].requires_grad) {
-        node->grad_input_buffers[1] = 1;  // placeholder
-        // TODO: dispatch matmul shader with transposed A
-    }
-}
+        struct { uint32_t batch_seq, input_dim, output_dim, pass_type; } push;
+        push.batch_seq = batch_seq;
+        push.input_dim = input_dim;
+        push.pass_type = 0;
 
-void BackwardEngine::backward_relu(Node* node) {
-    // ReLU: y = max(0, x)
-    // dL/dx = dL/dy * (x > 0)
-    // Uses saved pre-activation x to compute the mask.
-    stats_.shaders_dispatched++;
+        for (uint32_t c = 0; c < num_chunks; ++c) {
+            uint32_t row_start = c * chunk_rows;
+            uint32_t rows_this = std::min(chunk_rows, output_dim - row_start);
+            push.output_dim = rows_this;
 
-    if (node->inputs[0].requires_grad) {
-        node->grad_input_buffers[0] = 1;  // placeholder
-        // TODO: dispatch activation-relu-backward.glsl
-        //   binding 0: grad_output
-        //   binding 1: saved input (x)
-        //   binding 2: grad_input (output)
+            VkDeviceSize goOff   = VkDeviceSize(row_start) * sizeof(float);
+            VkDeviceSize goRange = VkDeviceSize(batch_seq) * rows_this * sizeof(float);
+            VkDeviceSize wOff    = VkDeviceSize(row_start) * input_dim * sizeof(float);
+            VkDeviceSize wRange  = VkDeviceSize(rows_this) * input_dim * sizeof(float);
+
+            // First chunk writes to grad_x directly; subsequent write to temp
+            bool first = (c == 0);
+            uint64_t out_id = first ? grad_x_id :
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(grad_x_temp.handle));
+
+            if (!first)
+                std::memset(grad_x_temp.mappedPtr, 0, grad_x_bytes);
+
+            std::vector<VkDescriptorBufferInfo> bufInfos = {
+                {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(grad_out_id)),
+                 goOff, goRange},
+                {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(input_id)),
+                 0, x_bytes},
+                {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(W_id)),
+                 wOff, wRange},
+                {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(out_id)),
+                 0, grad_x_bytes},
+                {grad_w_buf.handle, 0, std::min(wRange, grad_w_bytes)},  // unused
+                {grad_b_buf.handle, 0, grad_b_bytes},                     // unused
+            };
+
+            VkDescriptorSet ds = cache_.allocDescriptorSet(
+                "fnn-linear-backward", bufInfos);
+
+            uint32_t gx = (input_dim + 15) / 16;
+            uint32_t gy = (batch_seq + 15) / 16;
+            batch_.begin();
+            batch_.dispatch(pipe.pipeline, pipe.layout, ds,
+                            gx, gy, 1, &push, sizeof(push));
+            batch_.submit();
+
+            // CPU accumulate: grad_x += temp (batch_seq * input_dim floats)
+            if (!first) {
+                auto* dst = static_cast<float*>(grad_x_buf.mappedPtr);
+                auto* src = static_cast<const float*>(grad_x_temp.mappedPtr);
+                size_t n = size_t(batch_seq) * input_dim;
+                for (size_t i = 0; i < n; ++i) dst[i] += src[i];
+            }
+        }
+        node->grad_input_buffers[0] = grad_x_id;
     }
+
+    // Passes 1 & 2: grad_W and grad_b (chunked, write to offsets)
+    for (uint32_t c = 0; c < num_chunks; ++c) {
+        uint32_t row_start = c * chunk_rows;
+        uint32_t rows_this = std::min(chunk_rows, output_dim - row_start);
+
+        VkDeviceSize goOff   = VkDeviceSize(row_start) * sizeof(float);
+        VkDeviceSize goRange = VkDeviceSize(batch_seq) * rows_this * sizeof(float);
+        VkDeviceSize wOff    = VkDeviceSize(row_start) * input_dim * sizeof(float);
+        VkDeviceSize wRange  = VkDeviceSize(rows_this) * input_dim * sizeof(float);
+        VkDeviceSize bOff    = VkDeviceSize(row_start) * sizeof(float);
+        VkDeviceSize bRange  = VkDeviceSize(rows_this) * sizeof(float);
+
+        struct { uint32_t batch_seq, input_dim, output_dim, pass_type; } push;
+        push.batch_seq = batch_seq;
+        push.input_dim = input_dim;
+
+        std::vector<VkDescriptorBufferInfo> bufInfos = {
+            {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(grad_out_id)),
+             goOff, goRange},
+            {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(node->inputs[0].buffer_id)),
+             0, x_bytes},
+            {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(W_id)),
+             wOff, wRange},
+            {grad_x_buf.handle, 0, grad_x_bytes},       // unused in passes 1,2
+            {grad_w_buf.handle, wOff, wRange},           // grad_W chunk
+            {grad_b_buf.handle, bOff, bRange},           // grad_b chunk
+        };
+
+        VkDescriptorSet ds = cache_.allocDescriptorSet(
+            "fnn-linear-backward", bufInfos);
+
+        // Pass 1: grad_W[chunk] = grad_output[chunk]^T @ input
+        push.output_dim = rows_this;
+        push.pass_type = 1;
+        {
+            uint32_t gx = (input_dim + 15) / 16;
+            uint32_t gy = (rows_this + 15) / 16;
+            batch_.begin();
+            batch_.dispatch(pipe.pipeline, pipe.layout, ds,
+                            gx, gy, 1, &push, sizeof(push));
+            batch_.submit();
+        }
+
+        // Pass 2: grad_b[chunk] = sum(grad_output[chunk], dim=0)
+        push.pass_type = 2;
+        {
+            uint32_t gx = (rows_this + 15) / 16;
+            batch_.begin();
+            batch_.dispatch(pipe.pipeline, pipe.layout, ds,
+                            gx, 1, 1, &push, sizeof(push));
+            batch_.submit();
+        }
+    }
+
+    // Store weight/bias gradients
+    {
+        uint64_t& gw = find_or_insert_grad(W_id);
+        gw = grad_w_id;
+        uint64_t& gb = find_or_insert_grad(b_id);
+        gb = grad_b_id;
+    }
+
+    stats_.shaders_dispatched += num_chunks * 3;
 }
 
 void BackwardEngine::backward_gelu(Node* node) {
-    // GELU backward — uses the pre-activation value
-    stats_.shaders_dispatched++;
+    // GELU backward: dL/dx = dL/dy * gelu'(x)
+    //
+    // Node layout:
+    //   inputs[0]  = x (pre-activation)
+    //   outputs[0] = y = gelu(x)
+    //   grad_output_buffer = dL/dy
+    //
+    // activation-gelu-backward.glsl bindings:
+    //   0: grad_output (dL/dy)   — readonly
+    //   1: input_data  (x)       — readonly
+    //   2: grad_input  (dL/dx)   — output
+    //   push: {total_elements}
+
+    uint32_t total = node->inputs[0].numel();
+    size_t bytes = total * sizeof(float);
+
+    uint64_t grad_out_id = node->grad_output_buffer;
+    uint64_t input_id    = node->inputs[0].buffer_id;
+
+    GrillyBuffer grad_in_buf = pool_.acquire(bytes);
+    backward_bufs_.push_back(grad_in_buf);
+    std::memset(grad_in_buf.mappedPtr, 0, bytes);
+
+    uint64_t grad_in_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_in_buf.handle));
+
+    PipelineEntry pipe = cache_.getOrCreate(
+        "activation-gelu-backward", 3, sizeof(uint32_t));
+
+    std::vector<VkDescriptorBufferInfo> bufInfos = {
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(grad_out_id)),
+         0, bytes},                                    // 0: grad_output
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(input_id)),
+         0, bytes},                                    // 1: input_data
+        {grad_in_buf.handle, 0, bytes},                // 2: grad_input
+    };
+
+    VkDescriptorSet descSet = cache_.allocDescriptorSet(
+        "activation-gelu-backward", bufInfos);
+
+    uint32_t gx = (total + 255) / 256;
+    batch_.begin();
+    batch_.dispatch(pipe.pipeline, pipe.layout, descSet,
+                    gx, 1, 1, &total, sizeof(total));
+    batch_.submit();
+
     if (node->inputs[0].requires_grad) {
-        node->grad_input_buffers[0] = 1;
-        // TODO: dispatch activation-gelu-backward.glsl
+        node->grad_input_buffers[0] = grad_in_id;
     }
+
+    stats_.shaders_dispatched++;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Backward Shader Dispatch — Stubs (not needed for VSA hypernetwork)
+// ═════════════════════════════════════════════════════════════════════════
+
+void BackwardEngine::backward_matmul(Node* node) {
+    stats_.shaders_dispatched++;
+    if (node->inputs[0].requires_grad)
+        node->grad_input_buffers[0] = 1;
+    if (node->inputs[1].requires_grad)
+        node->grad_input_buffers[1] = 1;
+}
+
+void BackwardEngine::backward_relu(Node* node) {
+    stats_.shaders_dispatched++;
+    if (node->inputs[0].requires_grad)
+        node->grad_input_buffers[0] = 1;
 }
 
 void BackwardEngine::backward_silu(Node* node) {
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-        // TODO: dispatch activation-silu-backward.glsl
-    }
 }
 
 void BackwardEngine::backward_tanh(Node* node) {
-    // tanh backward: dL/dx = dL/dy * (1 - tanh(x)^2)
-    // We save the output y = tanh(x) and compute 1 - y^2
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-        // TODO: dispatch tanh backward shader
-    }
 }
 
 void BackwardEngine::backward_sigmoid(Node* node) {
-    // sigmoid backward: dL/dx = dL/dy * sig(x) * (1 - sig(x))
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-    }
 }
 
 void BackwardEngine::backward_softmax(Node* node) {
-    // Softmax backward: efficient Jacobian computation
-    // dL/dx_i = s_i * (dL/dy_i - sum_j(dL/dy_j * s_j))
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-        // TODO: dispatch softmax backward shader
-    }
 }
 
 void BackwardEngine::backward_layernorm(Node* node) {
-    // LayerNorm backward: complex three-term gradient
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-        // TODO: dispatch layernorm-backward.glsl
-    }
 }
 
 void BackwardEngine::backward_attention(Node* node) {
-    // FlashAttention2 backward — most complex backward op
-    // Requires saved Q, K, V, and the softmax statistics (m, l)
     stats_.shaders_dispatched++;
     for (uint32_t i = 0; i < node->num_inputs && i < 3; ++i) {
-        if (node->inputs[i].requires_grad) {
+        if (node->inputs[i].requires_grad)
             node->grad_input_buffers[i] = 1;
-        }
     }
-    // TODO: dispatch flash-attention2-backward.glsl (tiled)
 }
 
 void BackwardEngine::backward_conv2d(Node* node) {
     stats_.shaders_dispatched++;
-    // Conv2d backward: input grad via transposed conv, weight grad via correlation
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-    }
-    if (node->num_inputs > 1 && node->inputs[1].requires_grad) {
+    if (node->num_inputs > 1 && node->inputs[1].requires_grad)
         node->grad_input_buffers[1] = 1;
-    }
 }
 
 void BackwardEngine::backward_conv1d(Node* node) {
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-    }
-    if (node->num_inputs > 1 && node->inputs[1].requires_grad) {
+    if (node->num_inputs > 1 && node->inputs[1].requires_grad)
         node->grad_input_buffers[1] = 1;
-    }
 }
 
 void BackwardEngine::backward_add(Node* node) {
-    // Add: y = a + b → dL/da = dL/dy, dL/db = dL/dy (identity)
-    // No shader needed — just pass through the gradient buffer
     for (uint32_t i = 0; i < node->num_inputs; ++i) {
-        if (node->inputs[i].requires_grad) {
+        if (node->inputs[i].requires_grad)
             node->grad_input_buffers[i] = node->grad_output_buffer;
-        }
     }
 }
 
 void BackwardEngine::backward_sub(Node* node) {
-    // Sub: y = a - b → dL/da = dL/dy, dL/db = -dL/dy
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = node->grad_output_buffer;
-    }
     if (node->num_inputs > 1 && node->inputs[1].requires_grad) {
-        node->grad_input_buffers[1] = 1;  // placeholder: negate shader
+        node->grad_input_buffers[1] = 1;
         stats_.shaders_dispatched++;
-        // TODO: dispatch negation shader
     }
 }
 
 void BackwardEngine::backward_mul(Node* node) {
-    // Mul: y = a * b → dL/da = dL/dy * b, dL/db = dL/dy * a
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-        // TODO: dispatch element-wise mul: grad_output * saved_b
-    }
-    if (node->num_inputs > 1 && node->inputs[1].requires_grad) {
+    if (node->num_inputs > 1 && node->inputs[1].requires_grad)
         node->grad_input_buffers[1] = 1;
-        // TODO: dispatch element-wise mul: grad_output * saved_a
-    }
 }
 
 void BackwardEngine::backward_div(Node* node) {
-    // Div: y = a / b
-    // dL/da = dL/dy / b
-    // dL/db = -dL/dy * a / b^2
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-    }
-    if (node->num_inputs > 1 && node->inputs[1].requires_grad) {
+    if (node->num_inputs > 1 && node->inputs[1].requires_grad)
         node->grad_input_buffers[1] = 1;
-    }
 }
 
 void BackwardEngine::backward_cross_entropy(Node* node) {
-    // Cross-entropy: combined softmax + NLL for numerical stability
-    // dL/dx = softmax(x) - one_hot(target)
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-        // TODO: dispatch cross-entropy-backward.glsl
-    }
 }
 
 void BackwardEngine::backward_mse(Node* node) {
-    // MSE: L = mean((y_pred - y_true)^2)
-    // dL/dy_pred = 2 * (y_pred - y_true) / N
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
+    if (node->inputs[0].requires_grad)
         node->grad_input_buffers[0] = 1;
-    }
 }
 
 void BackwardEngine::backward_cubemind_surprise(Node* node) {
-    // CubeMind Surprise-Momentum: modulate learning rate by VSA surprise.
-    //
-    // The surprise value from the hippocampal cache indicates how novel
-    // the current input is. High surprise → larger gradient step (learn more),
-    // low surprise → smaller step (already known).
-    //
-    // This is an EMA-based optimizer hook, not a traditional backward op.
-    // It scales the incoming gradient by a surprise-derived multiplier:
-    //   grad_modulated = grad_output * (1.0 + alpha * surprise)
-    //
-    // The emotion state (surprise, stress) was captured during the forward
-    // pass from the VSA cache lookup and stored inline in the node.
-
     float surprise = node->emotion.surprise;
-    float alpha = 0.5f;  // Surprise sensitivity — can be tuned
-
-    // Read alpha from params if provided
-    if (node->params_size >= sizeof(float)) {
+    float alpha = 0.5f;
+    if (node->params_size >= sizeof(float))
         std::memcpy(&alpha, node->params, sizeof(float));
-    }
 
-    // The gradient modulation can be dispatched as a simple scalar-multiply
-    // shader on the grad_output buffer, or done CPU-side for simplicity.
     if (node->inputs[0].requires_grad) {
-        // Multiplier = 1 + alpha * surprise
-        // High surprise → amplify gradient (learn more from novel inputs)
-        // Low surprise → attenuate gradient (already known)
         float multiplier = 1.0f + alpha * surprise;
-
-        // Store the multiplier in params for the scalar-multiply shader.
-        // The actual dispatch uses: output[i] = input[i] * multiplier
         std::memcpy(node->params, &multiplier, sizeof(float));
         node->params_size = sizeof(float);
-
         node->grad_input_buffers[0] = node->grad_output_buffer;
-        // TODO: dispatch scalar-multiply shader with push constant `multiplier`
         stats_.shaders_dispatched++;
     }
 }
 
 void BackwardEngine::backward_temporal_surprise(Node* node) {
-    // Temporal Foresight: modulate gradient by counterfactual contradiction.
-    //
-    // During the forward pass, N counterfactual branches were evaluated:
-    //   - Each branch: erase actual fact, insert "what if" fact, shift T+dt
-    //   - Each branch checked against the WorldModel via Hamming search
-    //
-    // The TemporalSurpriseParams (stored in node->params) contain:
-    //   avg_contradiction: mean surprise across all branches (0 = coherent, 1 = nonsense)
-    //   temporal_multiplier: pre-computed 1.0 - 2.0 * avg_contradiction
-    //
-    // Gradient modulation:
-    //   If futures are coherent (low contradiction) → multiplier ~1.0 (pass through)
-    //   If futures are contradictory (high contradiction) → multiplier < 0 (penalize)
-    //   The negative multiplier pushes weights AWAY from the incoherent trajectory.
-
     TemporalSurpriseParams tparams;
     std::memcpy(&tparams, node->params, sizeof(TemporalSurpriseParams));
 
     if (node->inputs[0].requires_grad) {
         float multiplier = tparams.temporal_multiplier * tparams.alpha;
-
-        // Clamp to [-1, 1] to prevent gradient explosion
         if (multiplier > 1.0f) multiplier = 1.0f;
         if (multiplier < -1.0f) multiplier = -1.0f;
-
-        // Store multiplier for scalar-multiply shader
         std::memcpy(node->params, &multiplier, sizeof(float));
         node->params_size = sizeof(float);
-
         node->grad_input_buffers[0] = node->grad_output_buffer;
-        // TODO: dispatch scalar-multiply shader with push constant `multiplier`
         stats_.shaders_dispatched++;
     }
 }
 
-// Shape ops — no GPU shader needed, just logical reshaping of the gradient
+// Shape ops — no GPU shader needed
 
 void BackwardEngine::backward_reshape(Node* node) {
-    // Reshape backward: gradient has the shape of the INPUT, not the output.
-    // Since data layout in memory is unchanged, just pass the buffer through.
     if (node->inputs[0].requires_grad) {
         node->grad_input_buffers[0] = node->grad_output_buffer;
     }
 }
 
 void BackwardEngine::backward_transpose(Node* node) {
-    // Transpose backward: transpose the gradient back.
-    // For 2D: just swap dims. For ND: reverse the permutation.
     stats_.shaders_dispatched++;
-    if (node->inputs[0].requires_grad) {
-        node->grad_input_buffers[0] = 1;  // placeholder: transpose shader
-        // TODO: dispatch transpose/permute shader
-    }
+    if (node->inputs[0].requires_grad)
+        node->grad_input_buffers[0] = 1;
 }
 
 void BackwardEngine::backward_sum(Node* node) {
-    // Sum backward: gradient is broadcast-expanded to input shape
     if (node->inputs[0].requires_grad) {
-        node->grad_input_buffers[0] = 1;  // placeholder: broadcast shader
+        node->grad_input_buffers[0] = 1;
         stats_.shaders_dispatched++;
     }
 }
 
 void BackwardEngine::backward_mean(Node* node) {
-    // Mean backward: gradient = 1/N * ones (broadcast)
     if (node->inputs[0].requires_grad) {
         node->grad_input_buffers[0] = 1;
         stats_.shaders_dispatched++;
@@ -526,12 +711,152 @@ void BackwardEngine::backward_mean(Node* node) {
 }
 
 void BackwardEngine::backward_vsa_surrogate_loss(Node* node) {
-    dispatch_vsa_loss_backward(pool_, batch_, cache_, node, 1.0f);
+    autograd::VSASurrogateLossParams params;
+    std::memcpy(&params, node->params, sizeof(params));
+    uint32_t batch_size = node->inputs[0].shape[0];
+    size_t grad_bytes = size_t(batch_size) * params.K * params.D * sizeof(float);
+    GrillyBuffer grad_buf = pool_.acquire(grad_bytes);
+    backward_bufs_.push_back(grad_buf);
+
+    std::memset(grad_buf.mappedPtr, 0, grad_bytes);
+
+    dispatch_vsa_loss_backward_with_buf(pool_, batch_, cache_, node, 1.0f, grad_buf);
     stats_.shaders_dispatched++;
 }
 
 void BackwardEngine::backward_vsa_unpack_project(Node* node) {
-    dispatch_vsa_unpack_project_backward(pool_, batch_, cache_, node);
+    // UnpackProject: output = unpack(vsa_bitpacked) @ W^T + b
+    // VSA state is discrete/bitpacked — no gradient for input.
+    // grad_W and grad_b computed via GPU shader that unpacks on-the-fly.
+
+    uint32_t batch_size = node->outputs[0].shape[0];
+    uint32_t output_dim = node->outputs[0].shape[1];
+    uint32_t num_words  = node->inputs[0].shape[0];
+    uint32_t vsa_dim    = num_words * 32;
+
+    uint64_t grad_out_id = node->grad_output_buffer;
+    uint64_t vsa_id      = node->inputs[0].buffer_id;
+    uint64_t W_id        = node->saved_buffer_ids[0];
+    uint64_t b_id        = node->saved_buffer_ids[1];
+
+    size_t grad_out_bytes = size_t(batch_size) * output_dim * sizeof(float);
+    size_t vsa_bytes      = size_t(num_words) * sizeof(uint32_t);
+    size_t grad_w_bytes   = size_t(output_dim) * vsa_dim * sizeof(float);
+    size_t grad_b_bytes   = output_dim * sizeof(float);
+
+    // Allocate gradient buffers
+    GrillyBuffer grad_w_buf = pool_.acquire(grad_w_bytes);
+    backward_bufs_.push_back(grad_w_buf);
+    GrillyBuffer grad_b_buf = pool_.acquire(grad_b_bytes);
+    backward_bufs_.push_back(grad_b_buf);
+
+    std::memset(grad_w_buf.mappedPtr, 0, grad_w_bytes);
+    std::memset(grad_b_buf.mappedPtr, 0, grad_b_bytes);
+
+    uint64_t grad_w_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_w_buf.handle));
+    uint64_t grad_b_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_b_buf.handle));
+
+    PipelineEntry pipe = cache_.getOrCreate(
+        "vsa-unpack-project-backward", 4, 5 * sizeof(uint32_t));
+
+    std::vector<VkDescriptorBufferInfo> bufInfos = {
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(grad_out_id)),
+         0, grad_out_bytes},                                            // 0: grad_output
+        {reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(vsa_id)),
+         0, vsa_bytes},                                                 // 1: vsa_data
+        {grad_w_buf.handle, 0, grad_w_bytes},                          // 2: grad_W
+        {grad_b_buf.handle, 0, grad_b_bytes},                          // 3: grad_b
+    };
+
+    VkDescriptorSet descSet = cache_.allocDescriptorSet(
+        "vsa-unpack-project-backward", bufInfos);
+
+    struct { uint32_t batch_size, vsa_dim, output_dim, num_words, pass_type; } push;
+    push.batch_size = batch_size;
+    push.vsa_dim    = vsa_dim;
+    push.output_dim = output_dim;
+    push.num_words  = num_words;
+
+    // Pass 0: grad_W = grad_output^T @ unpack(vsa)
+    push.pass_type = 0;
+    {
+        uint32_t gx = (vsa_dim + 15) / 16;
+        uint32_t gy = (output_dim + 15) / 16;
+        batch_.begin();
+        batch_.dispatch(pipe.pipeline, pipe.layout, descSet,
+                        gx, gy, 1, &push, sizeof(push));
+        batch_.submit();
+        stats_.shaders_dispatched++;
+    }
+
+    // Pass 1: grad_b = sum(grad_output, dim=0)
+    push.pass_type = 1;
+    {
+        uint32_t gx = (output_dim + 15) / 16;
+        batch_.begin();
+        batch_.dispatch(pipe.pipeline, pipe.layout, descSet,
+                        gx, 1, 1, &push, sizeof(push));
+        batch_.submit();
+        stats_.shaders_dispatched++;
+    }
+
+    // No gradient for VSA input (discrete/bitpacked)
+    node->grad_input_buffers[0] = 0;
+
+    // Store weight/bias gradients in grad_table_ for optimizer
+    {
+        uint64_t& gw = find_or_insert_grad(W_id);
+        gw = grad_w_id;
+        uint64_t& gb = find_or_insert_grad(b_id);
+        gb = grad_b_id;
+    }
+}
+
+void BackwardEngine::backward_vsa_lora_expand(Node* node) {
+    VSALoRAExpandParams params;
+    std::memcpy(&params, node->params, sizeof(params));
+    uint32_t batch_size = node->inputs[0].shape[0];
+
+    size_t grad_coeffs_bytes = size_t(batch_size) * params.K * params.rank * sizeof(float);
+    GrillyBuffer grad_coeffs_buf = pool_.acquire(grad_coeffs_bytes);
+    backward_bufs_.push_back(grad_coeffs_buf);
+    std::memset(grad_coeffs_buf.mappedPtr, 0, grad_coeffs_bytes);
+
+    size_t grad_basis_bytes = size_t(params.D) * params.rank * sizeof(float);
+    GrillyBuffer grad_basis_buf = pool_.acquire(grad_basis_bytes);
+    backward_bufs_.push_back(grad_basis_buf);
+    std::memset(grad_basis_buf.mappedPtr, 0, grad_basis_bytes);
+
+    dispatch_lora_expand_backward(pool_, batch_, cache_, node, 1.0f,
+                                   grad_coeffs_buf, grad_basis_buf);
+
+    // Store B_basis gradient in grad_table_ for optimizer
+    uint64_t basis_id = node->saved_buffer_ids[0];
+    uint64_t grad_basis_id = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(grad_basis_buf.handle));
+    uint64_t& gb = find_or_insert_grad(basis_id);
+    gb = grad_basis_id;
+
+    stats_.shaders_dispatched++;
+}
+
+void BackwardEngine::backward_vsa_cosine_blend_loss(Node* node) {
+    VSACosineBlendLossParams params;
+    std::memcpy(&params, node->params, sizeof(params));
+    uint32_t batch_size = node->inputs[0].shape[0];
+
+    size_t grad_bytes = size_t(batch_size) * params.K * params.D * sizeof(float);
+    GrillyBuffer grad_buf = pool_.acquire(grad_bytes);
+    backward_bufs_.push_back(grad_buf);
+    std::memset(grad_buf.mappedPtr, 0, grad_bytes);
+
+    // Moderate gradient amplification: 10x compensates for cosine's
+    // intrinsic 1/(||b||*sqrt(D)) scaling without saturating the ±1.0
+    // per-element clamp in the backward shader.
+    float grad_scale = 10.0f;
+    dispatch_cosine_blend_loss_backward(pool_, batch_, cache_, node, grad_scale, grad_buf);
     stats_.shaders_dispatched++;
 }
 
@@ -541,7 +866,13 @@ void BackwardEngine::backward_vsa_unpack_project(Node* node) {
 
 TapeContext::TapeContext(BufferPool& pool, CommandBatch& batch,
                          PipelineCache& cache, size_t arena_capacity)
-    : arena_(arena_capacity), engine_(pool, batch, cache) {}
+    : pool_(pool), arena_(arena_capacity), engine_(pool, batch, cache) {}
+
+GrillyBuffer TapeContext::acquire_temp(size_t bytes) {
+    GrillyBuffer buf = pool_.acquire(bytes);
+    step_bufs_.push_back(buf);
+    return buf;
+}
 
 void TapeContext::begin() {
     arena_.reset();
@@ -567,13 +898,11 @@ Node* TapeContext::record_op(OpType op,
     node->params_size = 0;
     node->emotion = {0.0f, 0.0f};
 
-    // Zero out all IO slots
     std::memset(node->inputs, 0, sizeof(node->inputs));
     std::memset(node->outputs, 0, sizeof(node->outputs));
     std::memset(node->saved_buffer_ids, 0, sizeof(node->saved_buffer_ids));
     std::memset(node->grad_input_buffers, 0, sizeof(node->grad_input_buffers));
 
-    // Copy input/output descriptors
     for (uint32_t i = 0; i < num_inputs && i < kMaxNodeIO; ++i) {
         node->inputs[i] = inputs[i];
     }
@@ -581,7 +910,6 @@ Node* TapeContext::record_op(OpType op,
         node->outputs[i] = outputs[i];
     }
 
-    // Copy per-op parameters (push constant data)
     if (params && params_size > 0 && params_size <= sizeof(node->params)) {
         std::memcpy(node->params, params, params_size);
         node->params_size = params_size;
@@ -609,6 +937,16 @@ uint64_t TapeContext::get_grad_buffer(uint64_t input_buffer_id) const {
 }
 
 void TapeContext::end() {
+    for (auto& buf : step_bufs_) {
+        pool_.release(buf);
+    }
+    step_bufs_.clear();
+
+    for (auto& buf : engine_.backward_bufs_) {
+        pool_.release(buf);
+    }
+    engine_.backward_bufs_.clear();
+
     arena_.reset();
     engine_.clear_grads();
     seq_counter_ = 0;

@@ -24,6 +24,8 @@ static const char* kDesiredExtensions[] = {
     "VK_KHR_8bit_storage",
     "VK_KHR_storage_buffer_storage_class",
     "VK_KHR_vulkan_memory_model",
+    // Buffer Device Address: raw 64-bit GPU pointers via push constants
+    "VK_KHR_buffer_device_address",
     // Timeline semaphores for async command batch submission
     "VK_KHR_timeline_semaphore",
     // Memory priority: prevent WDDM from evicting VRAM allocations
@@ -288,6 +290,26 @@ void GrillyDevice::initVulkan() {
         pNextChain = &fp16Int8Features;
     }
 
+    // Buffer Device Address (VK_KHR_buffer_device_address) — raw 64-bit GPU pointers
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures{};
+    bdaFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    if (enabledExtensions_.count("VK_KHR_buffer_device_address")) {
+        VkPhysicalDeviceBufferDeviceAddressFeatures query{};
+        query.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+        VkPhysicalDeviceFeatures2 features2Query{};
+        features2Query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2Query.pNext = &query;
+        vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2Query);
+
+        bdaFeatures.bufferDeviceAddress = query.bufferDeviceAddress;
+        bdaFeatures.pNext = pNextChain;
+        pNextChain = &bdaFeatures;
+        if (query.bufferDeviceAddress)
+            std::cout << "[OK] bufferDeviceAddress enabled" << std::endl;
+    }
+
     // Memory priority (VK_EXT_memory_priority) — prevent WDDM VRAM eviction
     VkPhysicalDeviceMemoryPriorityFeaturesEXT memPriorityFeatures{};
     memPriorityFeatures.sType =
@@ -458,6 +480,10 @@ bool GrillyDevice::hasCooperativeMatrix() const {
 bool GrillyDevice::hasFloat16() const {
     return hasExtension("VK_KHR_shader_float16_int8") &&
            hasExtension("VK_KHR_16bit_storage");
+}
+
+bool GrillyDevice::hasBufferDeviceAddress() const {
+    return hasExtension("VK_KHR_buffer_device_address");
 }
 
 }  // namespace grilly

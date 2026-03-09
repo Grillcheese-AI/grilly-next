@@ -67,3 +67,15 @@ IEEE_PAPER.md
 runpodinfo.txt
 VSA_TODO.md
 docs/paper.md
+b64_test.txt
+docs/paper.tex
+/docs/plans
+docs/paper.tex
+/docs/pretrain_strategy
+/docs/todos
+grilly_preprocess.py
+grilly_preprocess_v2.py
+model/codebooks/vsa_codebook.bin
+model/student/cubemind_student.bin
+/pretraining
+/tools

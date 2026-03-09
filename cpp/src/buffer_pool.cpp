@@ -34,6 +34,10 @@ BufferPool::BufferPool(GrillyDevice& device) : device_(device) {
     if (device_.hasExtension("VK_EXT_memory_budget")) {
         allocInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
+    // Enable BDA support in VMA so it adds VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    if (device_.hasBufferDeviceAddress()) {
+        allocInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
 
     vkCheck(vmaCreateAllocator(&allocInfo, &allocator_),
             "vmaCreateAllocator failed");
@@ -84,6 +88,10 @@ GrillyBuffer BufferPool::allocateBuffer(size_t bucketSize) {
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = bucketSize;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // Add BDA usage bit so we can extract 64-bit GPU pointers
+    if (device_.hasBufferDeviceAddress()) {
+        bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     // VMA_MEMORY_USAGE_AUTO lets VMA pick the best heap.
@@ -103,6 +111,15 @@ GrillyBuffer BufferPool::allocateBuffer(size_t bucketSize) {
             "vmaCreateBuffer failed");
 
     buf.mappedPtr = buf.info.pMappedData;
+
+    // Extract BDA 64-bit virtual pointer
+    if (device_.hasBufferDeviceAddress()) {
+        VkBufferDeviceAddressInfo addrInfo{};
+        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addrInfo.buffer = buf.handle;
+        buf.deviceAddress = vkGetBufferDeviceAddress(device_.device(), &addrInfo);
+    }
+
     return buf;
 }
 
@@ -153,6 +170,7 @@ void BufferPool::release(GrillyBuffer& buf) {
     buf.handle = VK_NULL_HANDLE;
     buf.allocation = VK_NULL_HANDLE;
     buf.mappedPtr = nullptr;
+    buf.deviceAddress = 0;
 }
 
 // ── Device-Local Buffer ────────────────────────────────────────────────────
@@ -169,6 +187,9 @@ GrillyBuffer BufferPool::acquireDeviceLocal(size_t size) {
     bufferInfo.size = bucket;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (device_.hasBufferDeviceAddress()) {
+        bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VmaAllocationCreateInfo allocInfo{};
@@ -184,6 +205,14 @@ GrillyBuffer BufferPool::acquireDeviceLocal(size_t size) {
             "vmaCreateBuffer (device-local) failed");
 
     buf.mappedPtr = nullptr;  // Not host-visible
+
+    if (device_.hasBufferDeviceAddress()) {
+        VkBufferDeviceAddressInfo addrInfo{};
+        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addrInfo.buffer = buf.handle;
+        buf.deviceAddress = vkGetBufferDeviceAddress(device_.device(), &addrInfo);
+    }
+
     return buf;
 }
 
@@ -194,6 +223,9 @@ GrillyBuffer BufferPool::acquirePreferDeviceLocal(size_t size) {
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = bucket;
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (device_.hasBufferDeviceAddress()) {
+        bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     // Request host-visible mapping but PREFER device-local.
@@ -215,6 +247,14 @@ GrillyBuffer BufferPool::acquirePreferDeviceLocal(size_t size) {
             "vmaCreateBuffer (prefer-device-local) failed");
 
     buf.mappedPtr = buf.info.pMappedData;
+
+    if (device_.hasBufferDeviceAddress()) {
+        VkBufferDeviceAddressInfo addrInfo{};
+        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addrInfo.buffer = buf.handle;
+        buf.deviceAddress = vkGetBufferDeviceAddress(device_.device(), &addrInfo);
+    }
+
     return buf;
 }
 
@@ -418,6 +458,14 @@ void BufferPool::upload(GrillyBuffer& buf, const float* data, size_t bytes) {
     // For HOST_COHERENT memory this is a no-op, but VMA may choose
     // non-coherent memory for performance — flush is always safe.
     vmaFlushAllocation(allocator_, buf.allocation, 0, bytes);
+}
+
+void BufferPool::uploadPartial(GrillyBuffer& buf, const void* data,
+                               size_t offset, size_t bytes) {
+    if (!buf.mappedPtr)
+        throw std::runtime_error("Buffer has no persistent mapping");
+    std::memcpy(static_cast<uint8_t*>(buf.mappedPtr) + offset, data, bytes);
+    vmaFlushAllocation(allocator_, buf.allocation, offset, bytes);
 }
 
 void BufferPool::download(const GrillyBuffer& buf, float* out, size_t bytes) {

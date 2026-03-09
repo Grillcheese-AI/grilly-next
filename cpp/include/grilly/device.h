@@ -33,6 +33,7 @@ public:
     bool hasExtension(const std::string& name) const;
     bool hasCooperativeMatrix() const;
     bool hasFloat16() const;
+    bool hasBufferDeviceAddress() const;
 
     /// GPU name reported by the driver.
     const std::string& deviceName() const { return deviceName_; }

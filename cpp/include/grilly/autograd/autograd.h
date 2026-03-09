@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "grilly/autograd/tape_arena.h"
 #include "grilly/buffer_pool.h"
@@ -133,6 +134,8 @@ enum class OpType : uint8_t {
     // VSA Hypernetwork
     VSAUnpackProject,      // Fused bitunpack -> fp32 -> linear projection
     VSASurrogateLoss,      // Hinge + contrastive margin loss on K branches
+    VSALoRAExpand,         // LoRA basis expansion: delta_k = B @ c_k
+    VSACosineBlendLoss,    // Cosine blend loss with router + oracle distillation
 
     _Count  // sentinel
 };
@@ -163,19 +166,56 @@ static_assert(sizeof(TemporalSurpriseParams) <= 64,
 // trajectory branches. Forward pass writes winning_k, runner_up_k, and
 // loss_value; backward pass reads them to route gradients.
 //
-// Memory: 36 bytes (fits comfortably in the 64-byte params buffer).
+// Memory: 44 bytes (fits comfortably in the 64-byte params buffer).
 //
 struct VSASurrogateLossParams {
-    float gamma;           // Hinge margin (default 0.1)
-    float delta_margin;    // Contrastive margin (default 0.5)
-    float lambda;          // Contrastive weight (default 0.1)
+    float gamma;           // Hinge margin (default 1.0)
+    float delta_margin;    // Contrastive margin (default 1.0)
+    float lambda;          // Contrastive weight (default 0.3)
     uint32_t K;            // Number of future trajectories
     uint32_t D;            // VSA dimension (10240)
     uint32_t winning_k;    // Written by forward, read by backward
     uint32_t runner_up_k;  // Written by forward, read by backward
     float loss_value;      // Written by forward
+    float temperature;     // Gumbel-softmax temperature (default 1.0)
+    float diversity_lambda; // Diversity loss weight (default 0.01)
 };
 static_assert(sizeof(VSASurrogateLossParams) <= 64,
+              "Must fit in Node::params[64]");
+
+// ── VSALoRAExpandParams ──────────────────────────────────────────────
+//
+// Packed into Node::params[64] for VSALoRAExpand nodes.
+// Stores dimensions for LoRA basis expansion: delta_k = B @ c_k.
+//
+// Memory: 12 bytes.
+//
+struct VSALoRAExpandParams {
+    uint32_t K;         // Number of branches
+    uint32_t D;         // VSA dimension (vsa_dim)
+    uint32_t rank;      // LoRA basis rank
+};
+static_assert(sizeof(VSALoRAExpandParams) <= 64,
+              "Must fit in Node::params[64]");
+
+// ── VSACosineBlendLossParams ─────────────────────────────────────────
+//
+// Packed into Node::params[64] for VSACosineBlendLoss nodes.
+// Cosine blend loss with router-weighted branch mixing, oracle
+// distillation (KL divergence), and entropy regularization.
+//
+// Memory: 28 bytes.
+//
+struct VSACosineBlendLossParams {
+    uint32_t K;              // Number of branches
+    uint32_t D;              // VSA dimension (vsa_dim)
+    float temperature;       // Router softmax temperature
+    float lambda_distill;    // Oracle KL distillation weight
+    float lambda_entropy;    // Entropy regularization weight
+    float loss_value;        // Written by forward pass
+    float tau_oracle;        // Oracle softmax temperature
+};
+static_assert(sizeof(VSACosineBlendLossParams) <= 64,
               "Must fit in Node::params[64]");
 
 // ── Node ────────────────────────────────────────────────────────────────
@@ -298,6 +338,8 @@ private:
 
     /// Shader dispatch helpers for specific op types
     void backward_linear(Node* node);
+    void backward_linear_chunked(Node* node, uint32_t batch_seq,
+                                  uint32_t output_dim, uint32_t input_dim);
     void backward_matmul(Node* node);
     void backward_relu(Node* node);
     void backward_gelu(Node* node);
@@ -327,11 +369,17 @@ private:
     // VSA Hypernetwork backward handlers
     void backward_vsa_surrogate_loss(Node* node);
     void backward_vsa_unpack_project(Node* node);
+    void backward_vsa_lora_expand(Node* node);
+    void backward_vsa_cosine_blend_loss(Node* node);
 
     BufferPool& pool_;
     CommandBatch& batch_;
     PipelineCache& cache_;
     Stats stats_{};
+
+    // Per-step backward temporary buffers (released by TapeContext::end())
+    std::vector<GrillyBuffer> backward_bufs_;
+    friend class TapeContext;  // TapeContext releases these in end()
 
     // Gradient accumulation: input_buffer_id → accumulated_grad_buffer_id
     // Using a flat array (arena-friendly) instead of std::unordered_map.
@@ -380,11 +428,17 @@ public:
     /// Get gradient buffer for a specific input.
     uint64_t get_grad_buffer(uint64_t input_buffer_id) const;
 
-    /// End the tape: reset arena, clear gradients.
+    /// End the tape: reset arena, clear gradients, release step buffers.
     void end();
+
+    /// Acquire a GPU buffer that will be auto-released when end() is called.
+    /// Use for per-step temporaries (activations, intermediates, gradients).
+    /// Do NOT use for model weights — those should use pool.acquire() directly.
+    GrillyBuffer acquire_temp(size_t bytes);
 
     bool is_recording() const { return recording_; }
     TapeArena& arena() { return arena_; }
+    BufferPool& pool() { return pool_; }
     BackwardEngine::Stats last_backward_stats() const { return engine_.last_stats(); }
 
     // Arena stats
@@ -392,10 +446,12 @@ public:
     float arena_utilization() const { return arena_.utilization(); }
 
 private:
+    BufferPool& pool_;
     TapeArena arena_;
     BackwardEngine engine_;
     bool recording_ = false;
     uint32_t seq_counter_ = 0;
+    std::vector<GrillyBuffer> step_bufs_;
 };
 
 }  // namespace autograd

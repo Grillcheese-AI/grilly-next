@@ -69,18 +69,48 @@ public:
 
     /// Insert entry if surprise > threshold. Returns true if inserted.
     /// Surprise = 1.0 - (minHammingDistance / dim).
+    /// Uses CPU Hamming search (O(n) per insert — fine for small caches).
     bool insert(const BitpackedVec& key, const EmotionState& emotion);
 
-    /// Insert batch of entries (surprise-filtered).
+    /// GPU-accelerated insert: uses hamming-search.glsl for surprise check.
+    /// Maintains GPU buffer incrementally (appends new entries without
+    /// full re-upload), making bulk insertion O(n) total instead of O(n²).
+    bool insertGPU(CommandBatch& batch, PipelineCache& pipeCache,
+                   const BitpackedVec& key, const EmotionState& emotion);
+
+    /// Insert batch of entries (surprise-filtered, CPU path).
     /// Returns number actually inserted.
     uint32_t insertBatch(const std::vector<BitpackedVec>& keys,
                           const std::vector<EmotionState>& emotions);
+
+    /// GPU-accelerated batch insert. Each entry's surprise is checked
+    /// via GPU Hamming search with incremental buffer sync.
+    uint32_t insertBatchGPU(CommandBatch& batch, PipelineCache& pipeCache,
+                             const std::vector<BitpackedVec>& keys,
+                             const std::vector<EmotionState>& emotions);
+
+    /// Insert without surprise check (O(1) per insert).
+    /// For bulk ingestion of pre-deduplicated data where the O(n²)
+    /// surprise scan is unnecessary.
+    bool insertUnchecked(const BitpackedVec& key, const EmotionState& emotion);
+
+    /// Bulk unchecked insert. Returns number inserted (may be less than
+    /// keys.size() if capacity is exhausted).
+    uint32_t insertBatchUnchecked(const std::vector<BitpackedVec>& keys,
+                                   const std::vector<EmotionState>& emotions);
 
     /// Evict n lowest-utility entries.
     void evict(uint32_t count);
 
     /// Update utilities: decay all by utilityDecay, boost accessed indices.
     void updateUtility(const std::vector<uint32_t>& accessedIndices);
+
+    /// Grow the dimensionality of all stored vectors by growthDim bits.
+    /// If a saturated_bundle is provided, Sanger's GHA computes the
+    /// orthogonal residual for padding. Otherwise uses random noise.
+    /// Triggers a full GPU re-upload on next sync.
+    void growDimensionality(uint32_t growthDim,
+                            const BitpackedVec* saturated_bundle = nullptr);
 
     /// Get current stats.
     CacheStats stats() const;
@@ -120,8 +150,18 @@ private:
     // Stats
     CacheStats stats_;
 
+    // Sanger's GHA state for orthogonal dimension expansion
+    uint32_t num_principal_components_ = 8;  // M components to extract
+    float sanger_learning_rate_ = 0.01f;
+    std::vector<std::vector<float>> sanger_weights_;  // Shape: [M][D]
+
     void ensureGPUSync();
+    void ensureGPUCapacity();
     void growCapacity();
+
+    // Sanger's GHA: compute orthogonal residual from saturated bundle
+    std::vector<int8_t> computeSangerResidual(
+        const std::vector<int8_t>& saturated_bundle);
 
     // Top-k selection on CPU (from Hamming distances)
     void topKSelect(const uint32_t* distances, uint32_t n,

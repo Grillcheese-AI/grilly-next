@@ -73,7 +73,7 @@ public:
         const std::string& relation,
         const std::string& object) const;
 
-    /// Add a fact to the world model.
+    /// Add a fact to the world model (CPU surprise check).
     /// Also generates and stores the corresponding negation constraint.
     ///
     /// Example: add_fact("dog", "is", "animal")
@@ -82,6 +82,21 @@ public:
     void add_fact(const std::string& subject,
                   const std::string& relation,
                   const std::string& object);
+
+    /// GPU-accelerated fact insertion. Uses GPU Hamming search for
+    /// surprise checking during cache insert, avoiding the O(n²) CPU
+    /// bottleneck during bulk ingestion.
+    void add_fact_gpu(CommandBatch& batch, PipelineCache& pipeCache,
+                      const std::string& subject,
+                      const std::string& relation,
+                      const std::string& object);
+
+    /// Unchecked fact insertion — skips surprise filtering.
+    /// For bulk ingestion of pre-deduplicated data. O(1) per fact
+    /// instead of O(n) surprise scan.
+    void add_fact_unchecked(const std::string& subject,
+                            const std::string& relation,
+                            const std::string& object);
 
     /// Add a pre-encoded fact vector directly (no negation auto-generation).
     void add_fact_vec(const cubemind::BitpackedVec& fact_vec);

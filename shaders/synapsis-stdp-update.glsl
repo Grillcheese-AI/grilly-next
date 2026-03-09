@@ -22,39 +22,37 @@ layout(push_constant) uniform PushConsts {
     uint batch_size;
     uint in_features;
     uint out_features;
-    float stdp_lr;        // STDP learning rate
-    float weight_min;     // Minimum weight value (e.g., -10.0)
-    float weight_max;     // Maximum weight value (e.g., 10.0)
+    float lr;             // Learning rate
+    float weight_min;     // Minimum weight value
+    float weight_max;     // Maximum weight value
+    float decay;          // Weight decay multiplier (e.g., 0.999)
 };
 
 void main() {
     // Each thread handles one weight: W[post_idx][pre_idx]
     uint post_idx = gl_GlobalInvocationID.y;
     uint pre_idx = gl_GlobalInvocationID.x;
-    
+
     if (post_idx >= out_features || pre_idx >= in_features) {
         return;
     }
-    
+
     // Compute batch-averaged traces
     float pre_avg = 0.0;
     float post_avg = 0.0;
-    
+
     for (uint b = 0; b < batch_size; b++) {
         pre_avg += pre_trace[b * in_features + pre_idx];
         post_avg += post_trace[b * out_features + post_idx];
     }
-    
+
     pre_avg /= float(batch_size);
     post_avg /= float(batch_size);
-    
-    // STDP weight update: ΔW = η * post ⊗ pre (outer product)
-    float dw = stdp_lr * post_avg * pre_avg;
-    
-    // Update weight with clamping
+
+    // Hebbian update: W = decay * W + lr * post ⊗ pre
     uint weight_idx = post_idx * in_features + pre_idx;
-    float new_weight = W[weight_idx] + dw;
+    float new_weight = decay * W[weight_idx] + lr * post_avg * pre_avg;
     new_weight = clamp(new_weight, weight_min, weight_max);
-    
+
     W[weight_idx] = new_weight;
 }

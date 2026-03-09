@@ -31,6 +31,8 @@ keywords = [
 dependencies = [
     "numpy>=1.24",
     "grilly>=0.4.5",
+    "spacy>=3.8.11",
+    "mcp>=1.26.0",
 ]
 
 [project.optional-dependencies]
