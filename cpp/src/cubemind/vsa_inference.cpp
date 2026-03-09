@@ -5,6 +5,10 @@
 #include <iostream>
 #include <stdexcept>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 namespace grilly {
 namespace cubemind {
 

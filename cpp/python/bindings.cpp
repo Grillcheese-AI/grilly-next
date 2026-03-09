@@ -1921,6 +1921,93 @@ PYBIND11_MODULE(grilly_core, m) {
         .def_property_readonly("state_dim",
              &grilly::cubemind::VSAInferenceEngine::state_dim);
 
+    // ── CubeMind: VSABaremetalEngine (Two-Shader Bare-Metal Pipeline) ────
+
+    py::class_<grilly::cubemind::VSABaremetalEngine>(m, "VSABaremetalEngine")
+        .def(py::init(
+                 [](GrillyCoreContext& ctx, uint32_t state_dim) {
+                     return new grilly::cubemind::VSABaremetalEngine(
+                         ctx.pool, state_dim);
+                 }),
+             py::arg("device"), py::arg("state_dim") = 10240,
+             py::keep_alive<1, 2>())
+        .def("load_logic_weights",
+             &grilly::cubemind::VSABaremetalEngine::load_logic_weights,
+             py::arg("filepath"),
+             "Load binarized student logic weights from file")
+        .def("load_codebook",
+             py::overload_cast<const std::string&,
+                               const std::vector<std::string>&>(
+                 &grilly::cubemind::VSABaremetalEngine::load_codebook),
+             py::arg("codebook_path"), py::arg("vocabulary"),
+             "Load VSA codebook from file with vocabulary strings")
+        .def("load_codebook_array",
+             [](grilly::cubemind::VSABaremetalEngine& engine,
+                py::array_t<uint32_t> data,
+                const std::vector<std::string>& vocabulary) {
+                 auto buf = data.request();
+                 engine.load_codebook(
+                     static_cast<const uint32_t*>(buf.ptr), buf.size,
+                     vocabulary);
+             },
+             py::arg("data"), py::arg("vocabulary"),
+             "Load codebook from a numpy uint32 array with vocabulary")
+        .def("step",
+             [](grilly::cubemind::VSABaremetalEngine& engine,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> state_packed) -> py::dict {
+                 auto buf = state_packed.request();
+                 grilly::cubemind::BitpackedVec state;
+                 state.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 state.dim = engine.state_dim();
+
+                 auto result = engine.step(ctx.batch, ctx.cache, state);
+
+                 py::dict d;
+                 d["word"] = result.word;
+                 d["distance"] = result.distance;
+                 d["predicted_state"] = py::array_t<uint32_t>(
+                     result.predicted_state.data.size(),
+                     result.predicted_state.data.data());
+                 return d;
+             },
+             py::arg("device"), py::arg("state_packed"),
+             "Single inference step: transform + decode")
+        .def("generate",
+             [](grilly::cubemind::VSABaremetalEngine& engine,
+                GrillyCoreContext& ctx,
+                py::array_t<uint32_t> initial_state_packed,
+                uint32_t max_tokens) -> py::list {
+                 auto buf = initial_state_packed.request();
+                 grilly::cubemind::BitpackedVec state;
+                 state.data.assign(
+                     static_cast<uint32_t*>(buf.ptr),
+                     static_cast<uint32_t*>(buf.ptr) + buf.size);
+                 state.dim = engine.state_dim();
+
+                 auto words = engine.generate(
+                     ctx.batch, ctx.cache, state, max_tokens);
+
+                 py::list out;
+                 for (auto& w : words) out.append(w);
+                 return out;
+             },
+             py::arg("device"), py::arg("initial_state_packed"),
+             py::arg("max_tokens") = 50,
+             "Run full autoregressive generation loop")
+        .def("get_word",
+             &grilly::cubemind::VSABaremetalEngine::get_word,
+             py::arg("token_id"),
+             "Get word by token ID")
+        .def_property_readonly("ready",
+             &grilly::cubemind::VSABaremetalEngine::ready)
+        .def_property_readonly("vocab_size",
+             &grilly::cubemind::VSABaremetalEngine::vocab_size)
+        .def_property_readonly("state_dim",
+             &grilly::cubemind::VSABaremetalEngine::state_dim);
+
     // ── CubeMind: ResonatorNetwork (GPU Hamming Similarity Generation) ──
 
     py::class_<grilly::cubemind::ResonatorNetwork>(m, "ResonatorNetwork")
