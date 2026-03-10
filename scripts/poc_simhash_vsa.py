@@ -312,17 +312,17 @@ class SelfBinarizingMLP:
         w3_bin = tanh(self.w3 * v)
         w4_bin = tanh(self.w4 * v)
 
-        # Layer 1: input -> hidden
-        h1 = tanh(matmul(x, transpose(w1_bin)) * v)
+        # Layer 1: input -> hidden (no v on activation — only weights are binarized)
+        h1 = tanh(matmul(x, transpose(w1_bin)))
 
         # Layer 2: hidden -> hidden + residual (multiply = XOR in bipolar)
-        h2 = tanh(matmul(h1, transpose(w2_bin)) * v) * h1
+        h2 = tanh(matmul(h1, transpose(w2_bin))) * h1
 
         # Layer 3: hidden -> hidden + residual
-        h3 = tanh(matmul(h2, transpose(w3_bin)) * v) * h2
+        h3 = tanh(matmul(h2, transpose(w3_bin))) * h2
 
         # Layer 4: hidden -> output
-        out = tanh(matmul(h3, transpose(w4_bin)) * v)
+        out = tanh(matmul(h3, transpose(w4_bin)))
 
         return out
 
@@ -460,24 +460,29 @@ def main():
         lr=args.lr,
         weight_decay=0.01,
         hyper_lr=0.01,
-        lr_min=1e-5,
+        lr_min=1e-4,
         lr_max=0.05,
         warmup_steps=50,
         track_surprise=True,
         use_gpu=False,  # CPU training (numpy autograd)
     )
 
-    # Sharpness annealing: v = 1 → v_max linearly over training
+    # Sharpness annealing: v=1 for first half (learn), v=1→10 for second half (binarize)
     v_min = 1.0
     v_max = 10.0
+    anneal_start = args.steps // 2  # start annealing at 50%
 
     rng = np.random.default_rng(args.seed + 1)
     best_sim = 0.0
     t_start = time.perf_counter()
 
     for step in range(1, args.steps + 1):
-        # Anneal sharpness
-        model.sharpness = v_min + (v_max - v_min) * (step - 1) / max(args.steps - 1, 1)
+        # Two-phase annealing: learn first, binarize second
+        if step <= anneal_start:
+            model.sharpness = v_min
+        else:
+            t = (step - anneal_start) / max(args.steps - anneal_start, 1)
+            model.sharpness = v_min + (v_max - v_min) * t
 
         # Sample batch
         idx = rng.choice(len(train_states), size=BATCH_SIZE, replace=False)
@@ -492,9 +497,10 @@ def main():
         margin = out.data * batch_y
         loss_val = float(np.mean(np.log1p(np.exp(-margin))))
 
-        # Backward: d/d(out) = -target * sigmoid(-margin) / N
+        # Backward: d/d(out) = -target * sigmoid(-margin), mean over dim only
+        # (matches old STE gradient scaling — mean per-element, not per-batch)
         sigmoid_neg = 1.0 / (1.0 + np.exp(margin))
-        grad_output = -batch_y * sigmoid_neg / margin.size
+        grad_output = -batch_y * sigmoid_neg / batch_x.shape[1]
         out.backward(grad_output)
 
         # Gradient norm (for monitoring)

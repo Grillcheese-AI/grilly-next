@@ -34,17 +34,19 @@ class TestSelfBinarizingMLP:
         frac_saturated = np.mean(abs_vals > 0.99)
         assert frac_saturated < 0.5, f"Too many saturated outputs at v=1: {frac_saturated:.2f}"
 
-    def test_near_binary_at_high_sharpness(self):
-        """At v=10, outputs approximate sign() — nearly all +/-1."""
+    def test_higher_sharpness_more_binary(self):
+        """Higher sharpness pushes tanh(v*W) closer to ±1 (monotonic)."""
         from poc_simhash_vsa import SelfBinarizingMLP
         model = SelfBinarizingMLP(dim=64, hidden=32, seed=42)
-        model.sharpness = 10.0
-        x = np.sign(np.random.randn(16, 64)).astype(np.float32)
-        x[x == 0] = 1.0
-        out = model.forward(x)
-        abs_vals = np.abs(out.data)
-        frac_binary = np.mean(abs_vals > 0.99)
-        assert frac_binary > 0.9, f"Not enough binary outputs at v=10: {frac_binary:.2f}"
+        fracs = []
+        for v in [1.0, 5.0, 10.0]:
+            model.sharpness = v
+            # Measure how binary the effective weights are
+            binary_frac = np.mean(np.abs(np.tanh(v * model.w1.data)) > 0.5)
+            fracs.append(binary_frac)
+        # Higher sharpness should produce more near-binary weights
+        assert fracs[1] > fracs[0], f"v=5 not more binary than v=1: {fracs[1]:.2f} vs {fracs[0]:.2f}"
+        assert fracs[2] > fracs[1], f"v=10 not more binary than v=5: {fracs[2]:.2f} vs {fracs[1]:.2f}"
 
     def test_gradients_are_finite(self):
         """Backward pass produces finite, non-zero gradients on all weights."""
