@@ -39,12 +39,13 @@ struct VSAInferenceParams {
 
 /// Push constants for vsa-bmm.glsl (2-layer binary matrix multiply).
 /// Two BDA pointers for the full student MLP: Layer 1 + Layer 2.
+/// Dimensions are parameterized via state_words and hidden_words.
 ///
-/// Weight layout in cubemind_student.bin:
-///   w1: hidden_dim neurons × words_per_vec words (e.g., 2048 × 320)
-///   w2: state_dim neurons × hidden_words words  (e.g., 10240 × 64)
+/// Weight layout in binary file:
+///   w1: hidden_dim neurons x state_words words (e.g., 1024 x 64 at d=2048)
+///   w2: state_dim neurons x hidden_words words (e.g., 2048 x 32 at d=2048)
 ///
-/// w2_ptr = w1_ptr + (hidden_dim × words_per_vec × sizeof(uint32))
+/// w2_ptr = w1_ptr + (hidden_dim x state_words x sizeof(uint32))
 struct VSABMMParams {
     uint64_t w1_ptr;       // BDA pointer to Layer 1 weights (input -> hidden)
     uint64_t w2_ptr;       // BDA pointer to Layer 2 weights (hidden -> output)

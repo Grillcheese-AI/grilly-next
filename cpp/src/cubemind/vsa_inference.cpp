@@ -156,10 +156,13 @@ std::vector<uint32_t> VSABaremetalEngine::loadBinaryFile(
     return buffer;
 }
 
-VSABaremetalEngine::VSABaremetalEngine(BufferPool& pool, uint32_t state_dim)
+VSABaremetalEngine::VSABaremetalEngine(BufferPool& pool, uint32_t state_dim,
+                                       uint32_t hidden_dim)
     : pool_(pool)
     , state_dim_(state_dim)
+    , hidden_dim_(hidden_dim)
     , words_per_vec_((state_dim + 31) / 32)
+    , hidden_words_((hidden_dim + 31) / 32)
     , logic_buf_{}
     , codebook_buf_{} {}
 
@@ -182,10 +185,16 @@ void VSABaremetalEngine::load_logic_weights(const std::string& filepath) {
     logic_buf_ = pool_.acquire(bytes);
     pool_.upload(logic_buf_, reinterpret_cast<const float*>(host_data.data()),
                  bytes);
+
+    // w1: hidden_dim neurons × words_per_vec words per neuron
+    w1_size_bytes_ = static_cast<size_t>(hidden_dim_) * words_per_vec_ *
+                     sizeof(uint32_t);
     logic_loaded_ = true;
 
     std::cout << "[OK] Logic weights loaded: " << bytes / 1024
-              << " KB, BDA=0x" << std::hex << logic_buf_.deviceAddress
+              << " KB (w1=" << w1_size_bytes_ / 1024 << " KB, w2="
+              << (bytes - w1_size_bytes_) / 1024 << " KB), BDA=0x"
+              << std::hex << logic_buf_.deviceAddress
               << std::dec << std::endl;
 }
 
@@ -233,8 +242,8 @@ VSABaremetalEngine::StepResult VSABaremetalEngine::step(
     StepResult result;
     const size_t stateBytes = words_per_vec_ * sizeof(uint32_t);
 
-    // ── STEP 1: TRANSFORMER (XNOR) ──────────────────────────────────
-    // Execute logic: predicted = XNOR(current_state, logic_weights)
+    // ── STEP 1: TRANSFORMER ────────────────────────────────────────────
+    // Execute 2-layer BMM: input -> hidden -> output, then XNOR bind
 
     GrillyBuffer bufInput = pool_.acquire(stateBytes);
     GrillyBuffer bufOutput = pool_.acquire(stateBytes);
@@ -243,9 +252,33 @@ VSABaremetalEngine::StepResult VSABaremetalEngine::step(
                  reinterpret_cast<const float*>(current_state.data.data()),
                  stateBytes);
 
-    if (pipeCache.hasShader("vsa-inference") &&
+    if (pipeCache.hasShader("vsa-bmm") &&
         logic_buf_.deviceAddress != 0) {
-        // GPU BDA path
+        // GPU BDA path: 2-layer binary matrix multiply
+        PipelineEntry pipe = pipeCache.getOrCreate(
+            "vsa-bmm", 2, sizeof(VSABMMParams));
+
+        std::vector<VkDescriptorBufferInfo> bufInfos = {
+            {bufInput.handle, 0, stateBytes},
+            {bufOutput.handle, 0, stateBytes},
+        };
+        VkDescriptorSet descSet =
+            pipeCache.allocDescriptorSet("vsa-bmm", bufInfos);
+
+        VSABMMParams push{};
+        push.w1_ptr = logic_buf_.deviceAddress;
+        push.w2_ptr = logic_buf_.deviceAddress + w1_size_bytes_;
+        push.state_words = words_per_vec_;
+        push.hidden_words = hidden_words_;
+
+        // Single workgroup of 64 threads
+        batch.begin();
+        batch.dispatch(pipe.pipeline, pipe.layout, descSet, 1, 1, 1,
+                       &push, sizeof(push));
+        batch.submit();
+    } else if (pipeCache.hasShader("vsa-inference") &&
+               logic_buf_.deviceAddress != 0) {
+        // Fallback: single-layer XNOR test shader
         PipelineEntry pipe = pipeCache.getOrCreate(
             "vsa-inference", 2, sizeof(VSAInferenceParams));
 
@@ -268,7 +301,7 @@ VSABaremetalEngine::StepResult VSABaremetalEngine::step(
                        &push, sizeof(push));
         batch.submit();
     } else {
-        // CPU fallback
+        // CPU fallback: simple XNOR (single-layer)
         const uint32_t* weights =
             static_cast<const uint32_t*>(logic_buf_.mappedPtr);
         uint32_t* output = static_cast<uint32_t*>(bufOutput.mappedPtr);
