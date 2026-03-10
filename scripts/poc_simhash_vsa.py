@@ -17,9 +17,14 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
 import time
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
 
 import numba as nb
 import numpy as np
@@ -334,6 +339,59 @@ class SelfBinarizingMLP:
             w.grad = None
 
 
+class FloatMLP:
+    """Standard float ReLU MLP — diagnostic baseline (no binarization).
+
+    Same 4-layer residual architecture but with unconstrained float weights
+    and ReLU activations. If this also hits ~0.60, the bottleneck is
+    data/task, not binarization.
+    """
+
+    def __init__(self, dim: int, hidden: int, seed: int = 42):
+        from grilly.nn.autograd import Variable
+
+        rng = np.random.default_rng(seed)
+        s1 = np.sqrt(2.0 / dim)
+        s2 = np.sqrt(2.0 / hidden)
+        s4 = np.sqrt(2.0 / hidden)
+
+        self.w1 = Variable(rng.standard_normal((hidden, dim)).astype(np.float32) * s1,
+                           requires_grad=True)
+        self.w2 = Variable(rng.standard_normal((hidden, hidden)).astype(np.float32) * s2,
+                           requires_grad=True)
+        self.w3 = Variable(rng.standard_normal((hidden, hidden)).astype(np.float32) * s2,
+                           requires_grad=True)
+        self.w4 = Variable(rng.standard_normal((dim, hidden)).astype(np.float32) * s4,
+                           requires_grad=True)
+        self.sharpness = 1.0  # unused, kept for interface compat
+
+    def forward(self, x_np: np.ndarray):
+        from grilly.nn.autograd import Variable, tanh, matmul, transpose, relu
+
+        x = Variable(x_np, requires_grad=False)
+
+        # Layer 1: input -> hidden (ReLU, no binarization)
+        h1 = relu(matmul(x, transpose(self.w1)))
+
+        # Layer 2: hidden -> hidden + additive residual
+        h2 = relu(matmul(h1, transpose(self.w2))) + h1
+
+        # Layer 3: hidden -> hidden + additive residual
+        h3 = relu(matmul(h2, transpose(self.w3))) + h2
+
+        # Layer 4: hidden -> output (tanh to bound in [-1, 1])
+        out = tanh(matmul(h3, transpose(self.w4)))
+
+        return out
+
+    def parameters(self):
+        return [self.w1, self.w2, self.w3, self.w4]
+
+    def zero_grad(self):
+        for w in self.parameters():
+            w.grad = None
+
+
 
 # ── Evaluation ────────────────────────────────────────────────────────
 
@@ -389,6 +447,8 @@ def main():
     parser.add_argument("--hidden", type=int, default=HIDDEN, help="MLP hidden dim")
     parser.add_argument("--lr", type=float, default=LR, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--float-diag", action="store_true",
+                        help="Use float ReLU MLP (no binarization) as diagnostic baseline")
     args = parser.parse_args()
 
     DIM = args.dim
@@ -448,11 +508,15 @@ def main():
     print(f"\n  Train: {len(train_states):,d}  Eval: {len(eval_states):,d}")
 
     # ── 4. Train ─────────────────────────────────────────────────────
+    mode = "float ReLU (diagnostic)" if args.float_diag else "self-binarizing tanh"
     print(f"\n[4/5] Training ({args.steps} steps, batch={BATCH_SIZE}, "
-          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, self-binarizing tanh) ...")
+          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, {mode}) ...")
     print()
 
-    model = SelfBinarizingMLP(DIM, HIDDEN, seed=args.seed)
+    if args.float_diag:
+        model = FloatMLP(DIM, HIDDEN, seed=args.seed)
+    else:
+        model = SelfBinarizingMLP(DIM, HIDDEN, seed=args.seed)
 
     from grilly.optim import AutoHypergradientAdamW
     optimizer = AutoHypergradientAdamW(
