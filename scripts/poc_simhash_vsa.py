@@ -6,14 +6,13 @@ accumulation make next-token prediction learnable.
 
 Pipeline:
   1. Load Qwen2.5 float embeddings -> SimHash to bipolar codebook
-  2. Build context VSA states via permutation + bundling
-  3. Train 2-layer MLP (grilly autograd) to predict binding transform
+  2. Build context VSA states via permute-bind chain (streaming, unlimited context)
+  3. Train 4-layer residual binary MLP (grilly autograd) to predict binding transform
   4. Eval: Hamming similarity of predicted vs true next-token code
 
 Usage:
     python scripts/poc_simhash_vsa.py --steps 2000
     python scripts/poc_simhash_vsa.py --steps 0          # embedding sanity check only
-    python scripts/poc_simhash_vsa.py --context-window 4  # tune context size
 """
 
 import argparse
@@ -37,7 +36,7 @@ DIM = 2048           # VSA dimension (reduced for POC; scale to 10240 after vali
 HIDDEN = 1024        # MLP hidden dimension
 BATCH_SIZE = 512     # Training batch size
 LR = 1e-3            # Learning rate
-GRAD_CLIP = 5.0      # Gradient clipping norm
+GRAD_CLIP = 1.0      # Gradient clipping norm (matches production train_student.py)
 EVAL_EVERY = 100     # Print metrics every N steps
 EVAL_SAMPLES = 512   # Number of samples for evaluation
 
@@ -138,53 +137,73 @@ def validate_simhash(codebook: np.ndarray, embeddings: np.ndarray):
 
 # ── VSA Context Accumulator (numba-accelerated) ─────────────────────
 
-@nb.njit(cache=True, parallel=True)
-def _build_all_pairs(codebook, flat_ids, pair_info, window, dim):
-    """Build all (context_state, transform) pairs in parallel with numba.
+@nb.njit(cache=True)
+def _build_permute_bind_pairs(codebook, flat_ids, traj_starts, traj_lengths,
+                               max_pairs, dim):
+    """Build (context_state, transform) pairs using permute-bind chain.
 
-    Args:
-        codebook: (vocab, dim) bipolar float32
-        flat_ids: flat int32 array of all token IDs across all trajectories
-        pair_info: (N, 3) int32 — [traj_flat_offset, pos_in_traj, next_token_id]
-        window: context window size
-        dim: VSA dimension
+    For each trajectory, walks tokens sequentially:
+        S_0 = codebook[tok_0]
+        S_t = roll(S_{t-1}, 1) * codebook[tok_t]   (element-wise multiply in bipolar)
 
-    Returns:
-        states: (N, dim) float32 bipolar
-        transforms: (N, dim) float32 bipolar
+    At each position t (starting from t=1), emits:
+        state = S_t
+        transform = S_t * codebook[next_token]   (binding transform)
     """
-    n = pair_info.shape[0]
-    states = np.empty((n, dim), dtype=np.float32)
-    transforms = np.empty((n, dim), dtype=np.float32)
+    n_traj = len(traj_starts)
 
-    for i in nb.prange(n):
-        traj_off = pair_info[i, 0]
-        pos = pair_info[i, 1]
-        next_tok = pair_info[i, 2]
+    # First pass: count total pairs
+    total = 0
+    for t in range(n_traj):
+        length = traj_lengths[t]
+        if length >= 2:
+            pairs_from_traj = length - 1
+            total += pairs_from_traj
+    if total > max_pairs:
+        total = max_pairs
 
-        start = pos - window + 1
-        if start < 0:
-            start = 0
+    states = np.empty((total, dim), dtype=np.float32)
+    transforms = np.empty((total, dim), dtype=np.float32)
 
-        # Permute + bundle inline
+    pair_idx = 0
+    for t in range(n_traj):
+        if pair_idx >= total:
+            break
+        start = traj_starts[t]
+        length = traj_lengths[t]
+        if length < 2:
+            continue
+
+        # Initialize state with first token
+        state = np.empty(dim, dtype=np.float32)
         for d in range(dim):
-            accum = np.float32(0.0)
-            for idx in range(start, pos + 1):
-                shift = pos - idx
-                src = (d - shift) % dim
-                accum += codebook[flat_ids[traj_off + idx], src]
-            if accum > 0.0:
-                states[i, d] = 1.0
-            elif accum < 0.0:
-                states[i, d] = -1.0
-            else:
-                states[i, d] = 1.0
+            state[d] = codebook[flat_ids[start], d]
 
-        # Transform = bind(context, next_token)
-        for d in range(dim):
-            transforms[i, d] = states[i, d] * codebook[next_tok, d]
+        for pos in range(1, length):
+            if pair_idx >= total:
+                break
 
-    return states, transforms
+            # Permute: circular shift by 1
+            last = state[dim - 1]
+            for d in range(dim - 1, 0, -1):
+                state[d] = state[d - 1]
+            state[0] = last
+
+            # Bind with current token (element-wise multiply in bipolar)
+            tok_id = flat_ids[start + pos]
+            for d in range(dim):
+                state[d] = state[d] * codebook[tok_id, d]
+
+            # Emit pair: (state, transform to next token)
+            if pos < length - 1:
+                next_tok = flat_ids[start + pos + 1]
+                for d in range(dim):
+                    states[pair_idx, d] = state[d]
+                    transforms[pair_idx, d] = state[d] * codebook[next_tok, d]
+                pair_idx += 1
+
+    # Trim to actual count
+    return states[:pair_idx], transforms[:pair_idx]
 
 
 # ── Data Loading ──────────────────────────────────────────────────────
@@ -207,132 +226,112 @@ def load_trajectories(path: Path, max_lines: int = 50000) -> list[list[int]]:
 
 
 def make_training_pairs(trajectories: list[list[int]], codebook: np.ndarray,
-                        window: int, max_pairs: int = 200000,
+                        max_pairs: int = 200000,
                         seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
     """Build (context_state, target_transform) pairs for training.
 
-    Uses numba-parallelized _build_all_pairs for speed.
+    Uses permute-bind chain: streaming, unlimited context, O(1) per token.
 
     Returns:
         states: (N, DIM) float32 bipolar context states
         transforms: (N, DIM) float32 bipolar target transforms
     """
-    rng = np.random.default_rng(seed)
     vocab_size = codebook.shape[0]
     dim = codebook.shape[1]
 
-    # Flatten all trajectories into one contiguous array + build pair metadata
-    flat_ids_list = []
-    pair_info_list = []  # (traj_flat_offset, pos_in_traj, next_token_id)
-    offset = 0
-
+    # Filter OOV tokens from trajectories
+    filtered = []
     for traj in trajectories:
-        traj_len = len(traj)
-        flat_ids_list.extend(traj)
-        for pos in range(window - 1, traj_len - 1):
-            next_tok = traj[pos + 1]
-            if next_tok < vocab_size:
-                pair_info_list.append((offset, pos, next_tok))
-        offset += traj_len
+        clean = [t for t in traj if t < vocab_size]
+        if len(clean) >= 3:
+            filtered.append(clean)
 
-    flat_ids = np.array(flat_ids_list, dtype=np.int32)
-    pair_info = np.array(pair_info_list, dtype=np.int32)
+    # Flatten trajectories + compute starts/lengths
+    flat_ids = np.concatenate([np.array(t, dtype=np.int32) for t in filtered])
+    traj_lengths = np.array([len(t) for t in filtered], dtype=np.int32)
+    traj_starts = np.zeros(len(filtered), dtype=np.int32)
+    traj_starts[1:] = np.cumsum(traj_lengths[:-1])
 
-    # Sample if too many
-    if len(pair_info) > max_pairs:
-        indices = rng.choice(len(pair_info), size=max_pairs, replace=False)
-        pair_info = pair_info[indices]
-
-    print(f"  Building {len(pair_info):,d} training pairs (window={window}) ...")
+    print(f"  Building {max_pairs:,d} training pairs (permute-bind chain) ...")
     print(f"  JIT compiling numba kernel (first run only) ...")
 
     t0 = time.perf_counter()
-    states, transforms = _build_all_pairs(codebook, flat_ids, pair_info, window, dim)
+    states, transforms = _build_permute_bind_pairs(
+        codebook, flat_ids, traj_starts, traj_lengths, max_pairs, dim)
     elapsed = time.perf_counter() - t0
 
-    print(f"  Done: {len(pair_info):,d} pairs in {elapsed:.1f}s")
+    print(f"  Done: {len(states):,d} pairs in {elapsed:.1f}s")
     return states, transforms
 
 
 # ── Model (grilly autograd) ──────────────────────────────────────────
 
-class BinaryMLP:
-    """2-layer MLP with sign activation (Straight-Through Estimator for backward).
+class SelfBinarizingMLP:
+    """4-layer residual MLP with tanh(v*x) self-binarizing annealing.
 
-    Forward: x -> W1*x -> sign(h) -> W2*sign(h)
-    Backward: STE passes gradients through sign as identity.
+    Replaces STE sign() with smooth tanh(v*x) where v anneals from 1 to v_max.
+    At v=1: smooth gradients, clean training signal.
+    At v=10: tanh ≈ sign, weights are effectively binary.
+    Export: sign(W_float) produces identical binary weights for GPU shader.
+
+    Architecture (bipolar float domain):
+        W_bin = tanh(v * W)                              (smooth weight binarization)
+        h1 = tanh(v * (W1_bin @ x))                      (input -> hidden)
+        h2 = tanh(v * (W2_bin @ h1)) * h1                (hidden -> hidden, residual)
+        h3 = tanh(v * (W3_bin @ h2)) * h2                (hidden -> hidden, residual)
+        out = tanh(v * (W4_bin @ h3))                     (hidden -> output)
     """
 
     def __init__(self, dim: int, hidden: int, seed: int = 42):
         from grilly.nn.autograd import Variable
 
         rng = np.random.default_rng(seed)
-        # Xavier-like init scaled for bipolar domain
-        scale1 = np.sqrt(2.0 / (dim + hidden))
-        scale2 = np.sqrt(2.0 / (hidden + dim))
+        s1 = np.sqrt(2.0 / (dim + hidden))
+        s2 = np.sqrt(2.0 / (hidden + hidden))
+        s4 = np.sqrt(2.0 / (hidden + dim))
 
-        self.w1 = Variable(
-            rng.standard_normal((hidden, dim)).astype(np.float32) * scale1,
-            requires_grad=True,
-        )
-        self.w2 = Variable(
-            rng.standard_normal((dim, hidden)).astype(np.float32) * scale2,
-            requires_grad=True,
-        )
+        self.w1 = Variable(rng.standard_normal((hidden, dim)).astype(np.float32) * s1,
+                           requires_grad=True)
+        self.w2 = Variable(rng.standard_normal((hidden, hidden)).astype(np.float32) * s2,
+                           requires_grad=True)
+        self.w3 = Variable(rng.standard_normal((hidden, hidden)).astype(np.float32) * s2,
+                           requires_grad=True)
+        self.w4 = Variable(rng.standard_normal((dim, hidden)).astype(np.float32) * s4,
+                           requires_grad=True)
+        self.sharpness = 1.0  # v parameter — annealed externally
 
-    def forward(self, x):
-        """Forward pass with STE sign activation."""
-        from grilly.nn.autograd import Variable
+    def forward(self, x_np: np.ndarray):
+        from grilly.nn.autograd import Variable, tanh, matmul, transpose
 
-        # Layer 1: linear
-        h = x @ self.w1.data.T  # (batch, hidden) — raw numpy matmul for speed
-        h = Variable(h, requires_grad=True)
+        v = self.sharpness
+        x = Variable(x_np, requires_grad=False)
 
-        # Sign activation with STE: forward uses sign, backward passes through
-        h_sign = Variable(np.sign(h.data).astype(np.float32), requires_grad=True)
-        # Link gradient: h_sign.grad will be copied to h.grad (STE)
-        h_sign._ste_source = h
+        # Smooth weight binarization: tanh(v * W) ≈ sign(W) as v → ∞
+        w1_bin = tanh(self.w1 * v)
+        w2_bin = tanh(self.w2 * v)
+        w3_bin = tanh(self.w3 * v)
+        w4_bin = tanh(self.w4 * v)
 
-        # Layer 2: linear
-        out_data = h_sign.data @ self.w2.data.T  # (batch, dim)
-        out = Variable(out_data, requires_grad=True)
+        # Layer 1: input -> hidden
+        h1 = tanh(matmul(x, transpose(w1_bin)) * v)
 
-        # Store intermediates for manual backward
-        self._cache = (x, h, h_sign, out)
+        # Layer 2: hidden -> hidden + residual (multiply = XOR in bipolar)
+        h2 = tanh(matmul(h1, transpose(w2_bin)) * v) * h1
+
+        # Layer 3: hidden -> hidden + residual
+        h3 = tanh(matmul(h2, transpose(w3_bin)) * v) * h2
+
+        # Layer 4: hidden -> output
+        out = tanh(matmul(h3, transpose(w4_bin)) * v)
+
         return out
 
-    def backward(self, grad_output: np.ndarray):
-        """Manual backward pass (grilly autograd handles the rest)."""
-        x_data, h, h_sign, out = self._cache
-
-        # Grad for W2: grad_output.T @ h_sign
-        grad_w2 = grad_output.T @ h_sign.data  # (dim, hidden)
-
-        # Grad through layer 2 -> h_sign
-        grad_h_sign = grad_output @ self.w2.data  # (batch, hidden)
-
-        # STE: pass gradient through sign unchanged
-        grad_h = grad_h_sign
-
-        # Grad for W1: grad_h.T @ x
-        grad_w1 = grad_h.T @ x_data  # (hidden, dim)
-
-        # Accumulate
-        if self.w1.grad is None:
-            self.w1.grad = grad_w1
-        else:
-            self.w1.grad += grad_w1
-        if self.w2.grad is None:
-            self.w2.grad = grad_w2
-        else:
-            self.w2.grad += grad_w2
-
     def parameters(self):
-        return [self.w1, self.w2]
+        return [self.w1, self.w2, self.w3, self.w4]
 
     def zero_grad(self):
-        self.w1.grad = None
-        self.w2.grad = None
+        for w in self.parameters():
+            w.grad = None
 
 
 def clip_grad_norm(params, max_norm: float):
@@ -378,12 +377,17 @@ class SimpleAdamW:
             m_hat = self.m[i] / (1 - self.beta1 ** self.t)
             v_hat = self.v[i] / (1 - self.beta2 ** self.t)
 
-            p.data -= self.lr * (m_hat / (np.sqrt(v_hat) + self.eps) + self.wd * p.data)
+            update = self.lr * (m_hat / (np.sqrt(v_hat) + self.eps) + self.wd * p.data)
+            # Per-element update clipping (matches Surprise-Momentum shader)
+            np.clip(update, -1.0, 1.0, out=update)
+            p.data -= update
+            # Weight bounds (prevents explosion through STE layers)
+            np.clip(p.data, -10.0, 10.0, out=p.data)
 
 
 # ── Evaluation ────────────────────────────────────────────────────────
 
-def evaluate(model: BinaryMLP, codebook: np.ndarray,
+def evaluate(model: SelfBinarizingMLP, codebook: np.ndarray,
              states: np.ndarray, transforms: np.ndarray,
              n_samples: int = EVAL_SAMPLES) -> dict:
     """Evaluate prediction quality via Hamming similarity.
@@ -433,7 +437,6 @@ def main():
 
     parser = argparse.ArgumentParser(description="SimHash VSA Next-Token POC")
     parser.add_argument("--steps", type=int, default=2000, help="Training steps (0 = sanity check only)")
-    parser.add_argument("--context-window", type=int, default=8, help="Context window size")
     parser.add_argument("--max-trajectories", type=int, default=10000, help="Max trajectories to load")
     parser.add_argument("--max-pairs", type=int, default=100000, help="Max training pairs")
     parser.add_argument("--dim", type=int, default=DIM, help="VSA dimension")
@@ -483,15 +486,9 @@ def main():
     avg_len = np.mean([len(t) for t in trajectories])
     print(f"  Average length: {avg_len:.1f} tokens")
 
-    # Filter tokens to valid vocab range
-    vocab_size = codebook.shape[0]
-    n_oov = sum(1 for t in trajectories for tok in t if tok >= vocab_size)
-    if n_oov > 0:
-        print(f"  Warning: {n_oov:,d} OOV tokens (id >= {vocab_size}) will be skipped")
-
     print()
     states, transforms = make_training_pairs(
-        trajectories, codebook, window=args.context_window,
+        trajectories, codebook,
         max_pairs=args.max_pairs, seed=args.seed,
     )
     # Free trajectories
@@ -506,12 +503,21 @@ def main():
 
     # ── 4. Train ─────────────────────────────────────────────────────
     print(f"\n[4/5] Training ({args.steps} steps, batch={BATCH_SIZE}, "
-          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, window={args.context_window}) ...")
+          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, permute-bind context) ...")
     print()
 
-    model = BinaryMLP(DIM, HIDDEN, seed=args.seed)
+    model = ResidualBinaryMLP(DIM, HIDDEN, seed=args.seed)
     optimizer = SimpleAdamW(model.parameters(), lr=args.lr)
     rng = np.random.default_rng(args.seed + 1)
+
+    # OSGM hypergradient controller (auto-tunes LR from loss curvature)
+    hyper_lr = 0.01
+    hyper_warmup = 50
+    meta_decay = 0.99
+    lr_min, lr_max = 1e-5, 0.05
+    G_lr = 1.0
+    loss_ema = None
+    loss_var = 1e-4
 
     best_sim = 0.0
     t_start = time.perf_counter()
@@ -526,19 +532,40 @@ def main():
         model.zero_grad()
         out = model.forward(batch_x)
 
-        # MSE loss (works well for bipolar targets in [-1, +1])
-        diff = out.data - batch_y
-        loss_val = float(np.mean(diff ** 2))
+        # Logistic loss: log(1 + exp(-output * target))
+        # Only cares about sign agreement, not magnitude
+        margin = out.data * batch_y  # positive where signs agree
+        loss_val = float(np.mean(np.log1p(np.exp(-margin))))
 
-        # Backward (manual, since we're doing STE)
-        grad_output = 2.0 * diff / diff.size  # d(MSE)/d(out)
-        # Scale up for batch accumulation
+        # Backward: d/d(out) = -target * sigmoid(-margin)
+        grad_output = -batch_y * (1.0 / (1.0 + np.exp(margin)))
+        grad_output /= (batch_x.shape[0] * batch_x.shape[1])  # mean
         grad_output *= BATCH_SIZE
         model.backward(grad_output)
 
         # Clip and step
         grad_norm = clip_grad_norm(model.parameters(), GRAD_CLIP)
         optimizer.step()
+
+        # OSGM hypergradient: adapt LR from loss curvature
+        if np.isfinite(loss_val):
+            if step <= hyper_warmup:
+                loss_ema = loss_val if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_val
+            else:
+                if loss_ema is None:
+                    loss_ema = loss_val
+                alpha = 0.01
+                loss_ema = (1.0 - alpha) * loss_ema + alpha * loss_val
+                diff_l = loss_val - loss_ema
+                loss_var = (1.0 - alpha) * loss_var + alpha * diff_l * diff_l
+                h = np.clip(diff_l / (np.sqrt(loss_var) + 1e-8), -1.0, 1.0)
+                G_lr = meta_decay * G_lr + (1.0 - meta_decay) * h * h
+                lr_delta = hyper_lr * h / (np.sqrt(G_lr) + 1e-8)
+                old_lr = optimizer.lr
+                target = old_lr - lr_delta
+                max_change = 0.03 * old_lr
+                target = np.clip(target, old_lr - max_change, old_lr + max_change)
+                optimizer.lr = float(np.clip(target, lr_min, lr_max))
 
         # Eval
         if step % EVAL_EVERY == 0 or step == 1:
@@ -550,6 +577,7 @@ def main():
                   f"ham_sim={metrics['hamming_sim']:.4f} | "
                   f"cos_sim={metrics['cosine_sim']:.4f} | "
                   f"gnorm={grad_norm:.2f} | "
+                  f"lr={optimizer.lr:.6f} | "
                   f"{elapsed:.0f}s")
 
     # ── 5. Final evaluation ──────────────────────────────────────────
@@ -560,7 +588,7 @@ def main():
     print()
 
     final = evaluate(model, codebook, eval_states, eval_transforms, n_samples=len(eval_states))
-    print(f"  Context window:     {args.context_window}")
+    print(f"  Context encoder:    permute-bind chain (unlimited)")
     print(f"  Training steps:     {args.steps}")
     print(f"  Training pairs:     {len(train_states):,d}")
     print(f"  Eval pairs:         {len(eval_states):,d}")
@@ -581,15 +609,17 @@ def main():
         print("  ** FAIL ** No meaningful signal above random.")
         print("  Investigate: SimHash quality, context encoding, or try Approach B/C.")
 
-    # Save weights for Vulkan export
+    # Save weights for Vulkan export (all 4 layers, binarized)
     weights_path = ROOT / "model" / "student" / "poc_weights.npz"
     weights_path.parent.mkdir(parents=True, exist_ok=True)
-    w1_bipolar = np.sign(model.w1.data).astype(np.float32)
-    w2_bipolar = np.sign(model.w2.data).astype(np.float32)
-    w1_bipolar[w1_bipolar == 0] = 1.0
-    w2_bipolar[w2_bipolar == 0] = 1.0
-    np.savez(str(weights_path), w1=w1_bipolar, w2=w2_bipolar)
-    print(f"\n  Weights saved to {weights_path}")
+    saved = {}
+    for name, param in [("w1", model.w1), ("w2", model.w2),
+                         ("w3", model.w3), ("w4", model.w4)]:
+        w = np.sign(param.data).astype(np.float32)
+        w[w == 0] = 1.0
+        saved[name] = w
+    np.savez(str(weights_path), **saved)
+    print(f"\n  Weights saved to {weights_path} (4 layers)")
 
     print()
     print("=" * 70)
