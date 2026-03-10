@@ -1876,7 +1876,7 @@ PYBIND11_MODULE(grilly_core, m) {
                      return new grilly::cubemind::VSAInferenceEngine(
                          ctx.pool, state_dim);
                  }),
-             py::arg("device"), py::arg("state_dim") = 10240,
+             py::arg("device"), py::arg("state_dim") = 2048,
              py::keep_alive<1, 2>())
         .def("load_weights",
              py::overload_cast<const std::string&>(
@@ -1925,11 +1925,13 @@ PYBIND11_MODULE(grilly_core, m) {
 
     py::class_<grilly::cubemind::VSABaremetalEngine>(m, "VSABaremetalEngine")
         .def(py::init(
-                 [](GrillyCoreContext& ctx, uint32_t state_dim) {
+                 [](GrillyCoreContext& ctx, uint32_t state_dim,
+                    uint32_t hidden_dim) {
                      return new grilly::cubemind::VSABaremetalEngine(
-                         ctx.pool, state_dim);
+                         ctx.pool, state_dim, hidden_dim);
                  }),
-             py::arg("device"), py::arg("state_dim") = 10240,
+             py::arg("device"), py::arg("state_dim") = 2048,
+             py::arg("hidden_dim") = 1024,
              py::keep_alive<1, 2>())
         .def("load_logic_weights",
              &grilly::cubemind::VSABaremetalEngine::load_logic_weights,

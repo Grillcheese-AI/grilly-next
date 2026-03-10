@@ -21,13 +21,13 @@ namespace cubemind {
 //
 // Binary format (cubemind_student.bin):
 //   Raw array of uint32_t words — bitpacked rows of the weight matrix.
-//   Each row is (state_dim / 32) words = 320 words at d=10240.
+//   Each row is (state_dim / 32) words = 64 words at d=2048.
 //
 // Dispatch pipeline:
-//   1. Upload input state to GPU buffer (1.25 KB at d=10240)
+//   1. Upload input state to GPU buffer (256 bytes at d=2048)
 //   2. Push BDA pointer + state_dim via push constants
 //   3. Dispatch vsa-inference shader: XNOR + POPCNT per word
-//   4. Download predicted state (1.25 KB)
+//   4. Download predicted state (256 bytes)
 
 /// Push constants for vsa-inference.glsl (single-layer XNOR test shader).
 /// The weight matrix pointer is a BDA 64-bit GPU virtual address.
@@ -53,11 +53,27 @@ struct VSABMMParams {
     uint32_t hidden_words; // Hidden dim in uint32 words (e.g., 32 for hidden=1024)
 };
 
+/// Push constants for vsa-bmm-residual.glsl (4-layer residual binary MLP).
+/// Single BDA pointer to contiguous weight buffer + dimension params.
+///
+/// Weight layout:
+///   W1: hidden_dim x state_words  (input -> hidden)
+///   W2: hidden_dim x hidden_words (hidden -> hidden)
+///   W3: hidden_dim x hidden_words (hidden -> hidden)
+///   W4: state_dim x hidden_words  (hidden -> output)
+struct VSABMMResidualParams {
+    uint64_t weights_ptr;    // BDA pointer to all weights contiguous
+    uint32_t state_words;    // input/output dim in uint32 words
+    uint32_t hidden_words;   // hidden dim in uint32 words
+    uint32_t num_layers;     // number of layers (4)
+    uint32_t _pad;           // padding for alignment
+};
+
 class VSAInferenceEngine {
 public:
     /// @param pool       BufferPool for GPU memory allocation
     /// @param state_dim  VSA bipolar dimension (default 10240)
-    VSAInferenceEngine(BufferPool& pool, uint32_t state_dim = 10240);
+    VSAInferenceEngine(BufferPool& pool, uint32_t state_dim = 2048);
     ~VSAInferenceEngine();
 
     VSAInferenceEngine(const VSAInferenceEngine&) = delete;
@@ -122,8 +138,8 @@ public:
     /// @param pool        BufferPool for GPU memory allocation
     /// @param state_dim   VSA bipolar dimension (default 10240)
     /// @param hidden_dim  Hidden layer dimension (default 2048)
-    VSABaremetalEngine(BufferPool& pool, uint32_t state_dim = 10240,
-                       uint32_t hidden_dim = 4096);
+    VSABaremetalEngine(BufferPool& pool, uint32_t state_dim = 2048,
+                       uint32_t hidden_dim = 1024);
     ~VSABaremetalEngine();
 
     VSABaremetalEngine(const VSABaremetalEngine&) = delete;
@@ -177,9 +193,10 @@ private:
     uint32_t words_per_vec_;    // state_dim / 32
     uint32_t hidden_words_;     // hidden_dim / 32
 
-    // Logic weights (persistent BDA buffer — contains both layers)
+    // Logic weights (persistent BDA buffer — contains all layers)
     GrillyBuffer logic_buf_;
     size_t w1_size_bytes_ = 0;  // Offset to w2 = w1_size_bytes_
+    size_t logic_buf_bytes_ = 0; // Total weight buffer size (kill switch for OOB)
     bool logic_loaded_ = false;
 
     // Codebook (persistent BDA buffer)
