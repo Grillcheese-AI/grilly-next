@@ -7,7 +7,7 @@ accumulation make next-token prediction learnable.
 Pipeline:
   1. Load Qwen2.5 float embeddings -> SimHash to bipolar codebook
   2. Build context VSA states via permute-bind chain (streaming, unlimited context)
-  3. Train 4-layer residual binary MLP (grilly autograd) to predict binding transform
+  3. Train 4-layer self-binarizing MLP (tanh annealing, grilly autograd) to predict binding transform
   4. Eval: Hamming similarity of predicted vs true next-token code
 
 Usage:
@@ -36,7 +36,7 @@ DIM = 2048           # VSA dimension (reduced for POC; scale to 10240 after vali
 HIDDEN = 1024        # MLP hidden dimension
 BATCH_SIZE = 512     # Training batch size
 LR = 1e-3            # Learning rate
-GRAD_CLIP = 1.0      # Gradient clipping norm (matches production train_student.py)
+GRAD_CLIP = 5.0      # Gradient clipping norm (tanh gradients well-behaved, loose safety net)
 EVAL_EVERY = 100     # Print metrics every N steps
 EVAL_SAMPLES = 512   # Number of samples for evaluation
 
@@ -334,78 +334,24 @@ class SelfBinarizingMLP:
             w.grad = None
 
 
-def clip_grad_norm(params, max_norm: float):
-    """Clip gradient norm across all parameters."""
-    total_norm_sq = 0.0
-    for p in params:
-        if p.grad is not None:
-            total_norm_sq += np.sum(p.grad ** 2)
-    total_norm = np.sqrt(total_norm_sq)
-    if total_norm > max_norm:
-        scale = max_norm / (total_norm + 1e-8)
-        for p in params:
-            if p.grad is not None:
-                p.grad *= scale
-    return total_norm
-
-
-# ── Simple AdamW (numpy, no GPU needed for POC) ─────────────────────
-
-class SimpleAdamW:
-    """Minimal AdamW for the POC. No GPU overhead."""
-
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, wd=0.01):
-        self.params = list(params)
-        self.lr = lr
-        self.beta1, self.beta2 = betas
-        self.eps = eps
-        self.wd = wd
-        self.t = 0
-        self.m = [np.zeros_like(p.data) for p in self.params]
-        self.v = [np.zeros_like(p.data) for p in self.params]
-
-    def step(self):
-        self.t += 1
-        for i, p in enumerate(self.params):
-            if p.grad is None:
-                continue
-            g = p.grad / BATCH_SIZE  # mean gradient
-
-            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
-            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (g ** 2)
-
-            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
-            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
-
-            update = self.lr * (m_hat / (np.sqrt(v_hat) + self.eps) + self.wd * p.data)
-            # Per-element update clipping (matches Surprise-Momentum shader)
-            np.clip(update, -1.0, 1.0, out=update)
-            p.data -= update
-            # Weight bounds (prevents explosion through STE layers)
-            np.clip(p.data, -10.0, 10.0, out=p.data)
-
 
 # ── Evaluation ────────────────────────────────────────────────────────
 
 def evaluate(model: SelfBinarizingMLP, codebook: np.ndarray,
              states: np.ndarray, transforms: np.ndarray,
              n_samples: int = EVAL_SAMPLES) -> dict:
-    """Evaluate prediction quality via Hamming similarity.
+    """Evaluate prediction quality via Hamming similarity."""
+    from grilly.nn.autograd import no_grad
 
-    For each sample:
-      1. Forward context state through model -> predicted transform
-      2. predicted_next = context * sign(predicted_transform)  (unbind)
-      3. true_next = context * true_transform  (unbind)
-      4. Hamming similarity between predicted_next and true_next
-    """
     rng = np.random.default_rng(77)
     idx = rng.choice(len(states), size=min(n_samples, len(states)), replace=False)
 
     batch_states = states[idx]
     batch_transforms = transforms[idx]
 
-    # Forward
-    out = model.forward(batch_states)
+    # Forward (no gradient tracking needed for eval)
+    with no_grad():
+        out = model.forward(batch_states)
     pred_transforms = np.sign(out.data)
     pred_transforms[pred_transforms == 0] = 1.0
 
@@ -503,69 +449,70 @@ def main():
 
     # ── 4. Train ─────────────────────────────────────────────────────
     print(f"\n[4/5] Training ({args.steps} steps, batch={BATCH_SIZE}, "
-          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, permute-bind context) ...")
+          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, self-binarizing tanh) ...")
     print()
 
-    model = ResidualBinaryMLP(DIM, HIDDEN, seed=args.seed)
-    optimizer = SimpleAdamW(model.parameters(), lr=args.lr)
+    model = SelfBinarizingMLP(DIM, HIDDEN, seed=args.seed)
+
+    from grilly.optim import AutoHypergradientAdamW
+    optimizer = AutoHypergradientAdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.01,
+        hyper_lr=0.01,
+        lr_min=1e-5,
+        lr_max=0.05,
+        warmup_steps=50,
+        track_surprise=True,
+        use_gpu=False,  # CPU training (numpy autograd)
+    )
+
+    # Sharpness annealing: v = 1 → v_max linearly over training
+    v_min = 1.0
+    v_max = 10.0
+
     rng = np.random.default_rng(args.seed + 1)
-
-    # OSGM hypergradient controller (auto-tunes LR from loss curvature)
-    hyper_lr = 0.01
-    hyper_warmup = 50
-    meta_decay = 0.99
-    lr_min, lr_max = 1e-5, 0.05
-    G_lr = 1.0
-    loss_ema = None
-    loss_var = 1e-4
-
     best_sim = 0.0
     t_start = time.perf_counter()
 
     for step in range(1, args.steps + 1):
+        # Anneal sharpness
+        model.sharpness = v_min + (v_max - v_min) * (step - 1) / max(args.steps - 1, 1)
+
         # Sample batch
         idx = rng.choice(len(train_states), size=BATCH_SIZE, replace=False)
         batch_x = train_states[idx]
         batch_y = train_transforms[idx]
 
-        # Forward
+        # Forward (autograd builds computation graph)
         model.zero_grad()
         out = model.forward(batch_x)
 
-        # Logistic loss: log(1 + exp(-output * target))
-        # Only cares about sign agreement, not magnitude
-        margin = out.data * batch_y  # positive where signs agree
+        # Logistic loss: mean(log(1 + exp(-output * target)))
+        margin = out.data * batch_y
         loss_val = float(np.mean(np.log1p(np.exp(-margin))))
 
-        # Backward: d/d(out) = -target * sigmoid(-margin)
-        grad_output = -batch_y * (1.0 / (1.0 + np.exp(margin)))
-        grad_output /= (batch_x.shape[0] * batch_x.shape[1])  # mean
-        grad_output *= BATCH_SIZE
-        model.backward(grad_output)
+        # Backward: d/d(out) = -target * sigmoid(-margin) / N
+        sigmoid_neg = 1.0 / (1.0 + np.exp(margin))
+        grad_output = -batch_y * sigmoid_neg / margin.size
+        out.backward(grad_output)
 
-        # Clip and step
-        grad_norm = clip_grad_norm(model.parameters(), GRAD_CLIP)
+        # Gradient norm (for monitoring)
+        grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm += np.sum(p.grad ** 2)
+        grad_norm = np.sqrt(grad_norm)
+
+        # Clip gradients
+        if grad_norm > GRAD_CLIP:
+            scale = GRAD_CLIP / (grad_norm + 1e-8)
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad *= scale
+
+        # Optimizer step
         optimizer.step()
-
-        # OSGM hypergradient: adapt LR from loss curvature
-        if np.isfinite(loss_val):
-            if step <= hyper_warmup:
-                loss_ema = loss_val if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_val
-            else:
-                if loss_ema is None:
-                    loss_ema = loss_val
-                alpha = 0.01
-                loss_ema = (1.0 - alpha) * loss_ema + alpha * loss_val
-                diff_l = loss_val - loss_ema
-                loss_var = (1.0 - alpha) * loss_var + alpha * diff_l * diff_l
-                h = np.clip(diff_l / (np.sqrt(loss_var) + 1e-8), -1.0, 1.0)
-                G_lr = meta_decay * G_lr + (1.0 - meta_decay) * h * h
-                lr_delta = hyper_lr * h / (np.sqrt(G_lr) + 1e-8)
-                old_lr = optimizer.lr
-                target = old_lr - lr_delta
-                max_change = 0.03 * old_lr
-                target = np.clip(target, old_lr - max_change, old_lr + max_change)
-                optimizer.lr = float(np.clip(target, lr_min, lr_max))
 
         # Eval
         if step % EVAL_EVERY == 0 or step == 1:
@@ -577,7 +524,8 @@ def main():
                   f"ham_sim={metrics['hamming_sim']:.4f} | "
                   f"cos_sim={metrics['cosine_sim']:.4f} | "
                   f"gnorm={grad_norm:.2f} | "
-                  f"lr={optimizer.lr:.6f} | "
+                  f"lr={optimizer.current_lr:.6f} | "
+                  f"v={model.sharpness:.1f} | "
                   f"{elapsed:.0f}s")
 
     # ── 5. Final evaluation ──────────────────────────────────────────
@@ -619,7 +567,7 @@ def main():
         w[w == 0] = 1.0
         saved[name] = w
     np.savez(str(weights_path), **saved)
-    print(f"\n  Weights saved to {weights_path} (4 layers)")
+    print(f"\n  Weights saved to {weights_path} (4 layers, sign-binarized from tanh)")
 
     print()
     print("=" * 70)
