@@ -449,6 +449,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--float-diag", action="store_true",
                         help="Use float ReLU MLP (no binarization) as diagnostic baseline")
+    parser.add_argument("--distill", action="store_true",
+                        help="Knowledge distillation: train float teacher, then distill to binary student")
+    parser.add_argument("--teacher-steps", type=int, default=3000,
+                        help="Steps to train float teacher (distill mode)")
+    parser.add_argument("--no-anneal", action="store_true",
+                        help="Keep v=1 throughout (no sharpness annealing), hard-snap at export")
     args = parser.parse_args()
 
     DIM = args.dim
@@ -508,9 +514,68 @@ def main():
     print(f"\n  Train: {len(train_states):,d}  Eval: {len(eval_states):,d}")
 
     # ── 4. Train ─────────────────────────────────────────────────────
-    mode = "float ReLU (diagnostic)" if args.float_diag else "self-binarizing tanh"
-    print(f"\n[4/5] Training ({args.steps} steps, batch={BATCH_SIZE}, "
-          f"lr={args.lr}, dim={DIM}, hidden={HIDDEN}, {mode}) ...")
+    from grilly.optim import AutoHypergradientAdamW
+    from grilly.nn.autograd import no_grad
+
+    # ── Distillation: train float teacher first, cache soft targets ──
+    soft_targets = None
+    if args.distill:
+        print(f"\n[4a/5] Training TEACHER (float ReLU, {args.teacher_steps} steps) ...")
+        print()
+
+        teacher = FloatMLP(DIM, HIDDEN, seed=args.seed)
+        t_opt = AutoHypergradientAdamW(
+            teacher.parameters(), lr=args.lr, weight_decay=0.01,
+            hyper_lr=0.01, lr_min=1e-4, lr_max=0.05,
+            warmup_steps=50, track_surprise=True, use_gpu=False,
+        )
+        rng_t = np.random.default_rng(args.seed + 1)
+        t_start = time.perf_counter()
+
+        for step in range(1, args.teacher_steps + 1):
+            idx = rng_t.choice(len(train_states), size=BATCH_SIZE, replace=False)
+            bx, by = train_states[idx], train_transforms[idx]
+            teacher.zero_grad()
+            out = teacher.forward(bx)
+            margin = out.data * by
+            loss_val = float(np.mean(np.log1p(np.exp(-margin))))
+            grad_output = -by * (1.0 / (1.0 + np.exp(margin))) / bx.shape[1]
+            out.backward(grad_output)
+            t_opt.step()
+
+            if step % EVAL_EVERY == 0 or step == 1:
+                metrics = evaluate(teacher, codebook, eval_states, eval_transforms)
+                elapsed = time.perf_counter() - t_start
+                print(f"  teacher {step:>5d} | loss={loss_val:.5f} | "
+                      f"ham_sim={metrics['hamming_sim']:.4f} | "
+                      f"cos_sim={metrics['cosine_sim']:.4f} | "
+                      f"lr={t_opt.current_lr:.6f} | {elapsed:.0f}s")
+
+        # Cache teacher outputs on ALL training data (soft targets)
+        print(f"\n  Generating soft targets on {len(train_states):,d} training pairs ...")
+        chunk = 2048
+        soft_targets = np.empty_like(train_states)
+        with no_grad():
+            for i in range(0, len(train_states), chunk):
+                end = min(i + chunk, len(train_states))
+                out = teacher.forward(train_states[i:end])
+                soft_targets[i:end] = out.data
+        teacher_sim = evaluate(teacher, codebook, eval_states, eval_transforms)
+        print(f"  Teacher final: ham_sim={teacher_sim['hamming_sim']:.4f}")
+        del teacher, t_opt  # free teacher memory
+        print()
+
+    # ── Main training (student or standalone) ────────────────────────
+    if args.distill:
+        mode = "distill (binary student <- float teacher)"
+    elif args.float_diag:
+        mode = "float ReLU (diagnostic)"
+    elif args.no_anneal:
+        mode = "self-binarizing tanh (v=1 fixed, snap at export)"
+    else:
+        mode = "self-binarizing tanh"
+    print(f"[4{'b' if args.distill else ''}/5] Training STUDENT ({args.steps} steps, "
+          f"batch={BATCH_SIZE}, lr={args.lr}, dim={DIM}, hidden={HIDDEN}, {mode}) ...")
     print()
 
     if args.float_diag:
@@ -518,23 +583,17 @@ def main():
     else:
         model = SelfBinarizingMLP(DIM, HIDDEN, seed=args.seed)
 
-    from grilly.optim import AutoHypergradientAdamW
     optimizer = AutoHypergradientAdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=0.01,
-        hyper_lr=0.01,
-        lr_min=1e-4,
-        lr_max=0.05,
-        warmup_steps=50,
-        track_surprise=True,
-        use_gpu=False,  # CPU training (numpy autograd)
+        model.parameters(), lr=args.lr, weight_decay=0.01,
+        hyper_lr=0.01, lr_min=1e-4, lr_max=0.05,
+        warmup_steps=50, track_surprise=True, use_gpu=False,
     )
 
     # Sharpness annealing: v=1 for first half (learn), v=1→10 for second half (binarize)
+    # --no-anneal: keep v=1 throughout, hard-snap to sign() at export
     v_min = 1.0
-    v_max = 10.0
-    anneal_start = args.steps // 2  # start annealing at 50%
+    v_max = 1.0 if args.no_anneal else 10.0
+    anneal_start = args.steps // 2
 
     rng = np.random.default_rng(args.seed + 1)
     best_sim = 0.0
@@ -551,20 +610,26 @@ def main():
         # Sample batch
         idx = rng.choice(len(train_states), size=BATCH_SIZE, replace=False)
         batch_x = train_states[idx]
-        batch_y = train_transforms[idx]
 
         # Forward (autograd builds computation graph)
         model.zero_grad()
         out = model.forward(batch_x)
 
-        # Logistic loss: mean(log(1 + exp(-output * target)))
-        margin = out.data * batch_y
-        loss_val = float(np.mean(np.log1p(np.exp(-margin))))
+        if soft_targets is not None:
+            # Distillation: MSE loss against teacher's soft outputs
+            batch_soft = soft_targets[idx]
+            diff = out.data - batch_soft
+            loss_val = float(np.mean(diff ** 2))
+            # Gradient of MSE: 2 * (out - target) / N
+            grad_output = 2.0 * diff / batch_x.shape[1]
+        else:
+            # Standard logistic loss against hard targets
+            batch_y = train_transforms[idx]
+            margin = out.data * batch_y
+            loss_val = float(np.mean(np.log1p(np.exp(-margin))))
+            sigmoid_neg = 1.0 / (1.0 + np.exp(margin))
+            grad_output = -batch_y * sigmoid_neg / batch_x.shape[1]
 
-        # Backward: d/d(out) = -target * sigmoid(-margin), mean over dim only
-        # (matches old STE gradient scaling — mean per-element, not per-batch)
-        sigmoid_neg = 1.0 / (1.0 + np.exp(margin))
-        grad_output = -batch_y * sigmoid_neg / batch_x.shape[1]
         out.backward(grad_output)
 
         # Gradient norm (for monitoring)
