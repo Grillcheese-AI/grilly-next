@@ -169,9 +169,7 @@ class TestVSABaremetalEngine:
         codebook[1] = 0xAAAAAAAA  # same as logic weights
         codebook[2] = 0x00000000
 
-        # Load via array APIs
-        engine.load_logic_weights_array = None  # check if array API exists
-        # For now, write temp files
+        # Write to temp files and load
         import tempfile, os
 
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
@@ -195,6 +193,59 @@ class TestVSABaremetalEngine:
             assert "word" in result
             assert "distance" in result
             assert isinstance(result["word"], str)
+        finally:
+            os.unlink(logic_path)
+            os.unlink(codebook_path)
+
+    def test_parameterized_dim_2048(self, device):
+        """Test GPU shader path at POC dimensions: state_dim=2048, hidden_dim=1024."""
+        import tempfile, os
+
+        state_dim = 2048
+        hidden_dim = 1024
+        state_words = state_dim // 32   # 64
+        hidden_words = hidden_dim // 32  # 32
+
+        rng = np.random.default_rng(42)
+
+        engine = grilly_core.VSABaremetalEngine(device, state_dim=state_dim, hidden_dim=hidden_dim)
+
+        # Synthetic weights: w1 (hidden_dim x state_words) + w2 (state_dim x hidden_words)
+        # w1: 1024 neurons * 64 words = 65536 uint32
+        # w2: 2048 neurons * 32 words = 65536 uint32
+        # Combined: 131072 uint32
+        w1 = rng.integers(0, 2**32, size=hidden_dim * state_words, dtype=np.uint32)
+        w2 = rng.integers(0, 2**32, size=state_dim * hidden_words, dtype=np.uint32)
+        logic_weights = np.concatenate([w1, w2])
+        assert len(logic_weights) == 131072
+
+        # Synthetic codebook: 10 entries x 64 words
+        vocab = [f"word_{i}" for i in range(10)]
+        codebook = rng.integers(0, 2**32, size=(10, state_words), dtype=np.uint32)
+
+        # Write to temp files and load
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            logic_weights.tofile(f)
+            logic_path = f.name
+
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            codebook.ravel().tofile(f)
+            codebook_path = f.name
+
+        try:
+            engine.load_logic_weights(logic_path)
+            engine.load_codebook(codebook_path, vocab)
+            assert engine.ready
+            assert engine.state_dim == 2048
+
+            # Run a step with random input (64 uint32 words)
+            input_state = rng.integers(0, 2**32, size=state_words, dtype=np.uint32)
+            result = engine.step(device, input_state)
+
+            assert "word" in result
+            assert "distance" in result
+            assert "predicted_state" in result
+            assert len(result["predicted_state"]) == state_words  # 64
         finally:
             os.unlink(logic_path)
             os.unlink(codebook_path)
