@@ -53,7 +53,7 @@ STATE_DIM = 2048
 HIDDEN_DIM = 1024
 WINDOW = 4
 SEED = 42
-TOKENIZER_MODEL = "Qwen/Qwen2.5-32B-Instruct"
+TOKENIZER_MODEL = "Qwen/Qwen2.5-0.5B"
 
 # -- Helpers ----------------------------------------------------------------
 
@@ -64,41 +64,46 @@ def load_vocabulary(path: pathlib.Path) -> list[str]:
         return [line.rstrip("\n") for line in f]
 
 
-def build_float_codebook(dim: int, seed: int) -> np.ndarray:
-    """Build a bipolar float codebook via SimHash projection.
+def load_bitpacked_codebook(path: str, words_per_vec: int) -> np.ndarray:
+    """Load the bitpacked codebook as a 2D uint32 array.
 
-    Must use the exact same method as the POC so that context accumulation
-    produces states compatible with the exported bitpacked codebook.
+    Returns (vocab_size, words_per_vec) uint32 array. Only 38MB for 152K tokens
+    instead of 1.2GB float codebook + 545MB embeddings.
     """
-    embeddings = np.load(EMB_PATH)
-    rng = np.random.default_rng(seed)
-    d_in = embeddings.shape[1]
-    codebook = np.empty((len(embeddings), dim), dtype=np.float32)
-    chunk = 1024
-    for start in range(0, dim, chunk):
-        end = min(start + chunk, dim)
-        R = rng.standard_normal((d_in, end - start)).astype(np.float32)
-        proj = embeddings @ R
-        codebook[:, start:end] = np.sign(proj)
-    codebook[codebook == 0] = 1.0
-    del embeddings
-    return codebook
+    raw = np.fromfile(path, dtype=np.uint32)
+    return raw.reshape(-1, words_per_vec)
+
+
+def unpack_bipolar(packed: np.ndarray) -> np.ndarray:
+    """Unpack a single uint32 vector to bipolar {-1, +1} float32.
+
+    Inverse of bipolar_to_bitpacked_vec: bit b of word w -> element w*32 + b.
+    """
+    words = len(packed)
+    dim = words * 32
+    result = np.empty(dim, dtype=np.float32)
+    for b in range(32):
+        bits = (packed >> b) & 1
+        result[b::32] = bits * 2.0 - 1.0  # 0 -> -1, 1 -> +1
+    return result
 
 
 def context_accumulate(
-    codebook: np.ndarray, token_ids: list[int], window: int
+    codebook_packed: np.ndarray, token_ids: list[int], window: int
 ) -> np.ndarray:
     """Roll + majority-vote bundle over a sliding window of recent tokens.
 
+    Uses bitpacked codebook — unpacks only the needed tokens (window=4).
     Each token vector is circular-shifted by its recency position (most recent
     token has shift=0), then all are summed and binarized via sign.
     """
     recent = token_ids[-window:]
-    dim = codebook.shape[1]
+    dim = codebook_packed.shape[1] * 32
     acc = np.zeros(dim, dtype=np.float32)
     for i, tok_id in enumerate(recent):
         shift = len(recent) - 1 - i  # most recent = shift 0
-        vec = np.roll(codebook[tok_id], shift)
+        vec = unpack_bipolar(codebook_packed[tok_id])
+        vec = np.roll(vec, shift)
         acc += vec
     result = np.sign(acc)
     result[result == 0] = 1.0
@@ -149,7 +154,6 @@ def main():
         (WEIGHTS_PATH, "student weights"),
         (CODEBOOK_PATH, "codebook"),
         (str(VOCAB_PATH), "vocabulary"),
-        (EMB_PATH, "Qwen embeddings"),
     ]:
         if not pathlib.Path(path).exists():
             missing.append((path, name))
@@ -182,14 +186,15 @@ def main():
     print(f"[TOKENIZE] Prompt: {repr(args.prompt)}")
     print(f"[TOKENIZE] Token IDs ({len(token_ids)}): {token_ids}")
 
-    # -- Build float codebook -----------------------------------------------
+    # -- Load bitpacked codebook for context accumulation --------------------
 
-    print(f"[CODEBOOK] Building SimHash float codebook (dim={STATE_DIM}, seed={SEED})...")
+    words_per_vec = STATE_DIM // 32
+    print(f"[CODEBOOK] Loading bitpacked codebook ({words_per_vec} words/vec)...")
     t0 = time.perf_counter()
-    float_codebook = build_float_codebook(STATE_DIM, SEED)
+    codebook_packed = load_bitpacked_codebook(CODEBOOK_PATH, words_per_vec)
     elapsed = time.perf_counter() - t0
-    print(f"[CODEBOOK] Built {float_codebook.shape[0]:,} x {float_codebook.shape[1]} "
-          f"codebook in {elapsed:.2f}s")
+    print(f"[CODEBOOK] Loaded {codebook_packed.shape[0]:,} x {codebook_packed.shape[1]} "
+          f"uint32 ({codebook_packed.nbytes / 1e6:.1f} MB) in {elapsed:.2f}s")
 
     # -- Initialize Vulkan engine -------------------------------------------
 
@@ -228,7 +233,7 @@ def main():
 
     for step in range(args.max_tokens):
         # 1. Context accumulation (CPU): roll + majority-vote bundle
-        context_float = context_accumulate(float_codebook, token_ids, WINDOW)
+        context_float = context_accumulate(codebook_packed, token_ids, WINDOW)
 
         # 2. Bitpack the context state to uint32
         context_packed = bipolar_to_bitpacked_vec(context_float)

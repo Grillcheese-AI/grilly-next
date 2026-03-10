@@ -108,10 +108,12 @@ def bitpack_codebook(codebook: np.ndarray) -> np.ndarray:
 
 # ── Vocabulary Export ─────────────────────────────────────────────────
 
-def export_vocabulary(output_path: Path):
+def export_vocabulary(output_path: Path, total_entries: int):
     """Export Qwen2.5-0.5B tokenizer vocabulary to a text file.
 
-    One token per line. Newlines within tokens are replaced with \\n.
+    One token per line, covering ALL embedding matrix entries (including
+    added/special tokens beyond tokenizer.vocab_size).
+    Newlines within tokens are replaced with \\n.
     """
     from transformers import AutoTokenizer
 
@@ -119,24 +121,22 @@ def export_vocabulary(output_path: Path):
     print(f"  Loading tokenizer for {model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-    vocab_size = tokenizer.vocab_size
-    print(f"  Tokenizer vocab size: {vocab_size}")
+    print(f"  Tokenizer vocab_size: {tokenizer.vocab_size}")
+    print(f"  Embedding entries:    {total_entries}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w", encoding="utf-8") as f:
-        for token_id in range(vocab_size):
+        for token_id in range(total_entries):
             try:
                 token_str = tokenizer.decode([token_id])
             except Exception:
                 token_str = f"<UNK_{token_id}>"
 
-            # Replace literal newlines so they don't break the line-per-token format
             token_str = token_str.replace("\n", "\\n")
-
             f.write(token_str + "\n")
 
-    print(f"  Vocabulary written to {output_path} ({vocab_size} tokens)")
+    print(f"  Vocabulary written to {output_path} ({total_entries} tokens)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -202,7 +202,7 @@ def main():
 
     # ── 4. Export vocabulary ──────────────────────────────────────────
     print(f"\n[4/4] Exporting vocabulary ...")
-    export_vocabulary(VOCAB_OUT)
+    export_vocabulary(VOCAB_OUT, vocab_size)
 
     # ── Summary ───────────────────────────────────────────────────────
     print()
