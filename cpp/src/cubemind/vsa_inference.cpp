@@ -189,6 +189,7 @@ void VSABaremetalEngine::load_logic_weights(const std::string& filepath) {
     // w1: hidden_dim neurons × words_per_vec words per neuron
     w1_size_bytes_ = static_cast<size_t>(hidden_dim_) * words_per_vec_ *
                      sizeof(uint32_t);
+    logic_buf_bytes_ = bytes;
     logic_loaded_ = true;
 
     std::cout << "[OK] Logic weights loaded: " << bytes / 1024
@@ -252,9 +253,42 @@ VSABaremetalEngine::StepResult VSABaremetalEngine::step(
                  reinterpret_cast<const float*>(current_state.data.data()),
                  stateBytes);
 
-    if (pipeCache.hasShader("vsa-bmm") &&
+    // Compute expected weight buffer sizes for safety checks (prevents OOB GPU reads)
+    const size_t residual_expected_bytes =
+        (size_t(hidden_dim_) * words_per_vec_ +         // W1
+         size_t(hidden_dim_) * hidden_words_ +          // W2
+         size_t(hidden_dim_) * hidden_words_ +          // W3
+         size_t(state_dim_)  * hidden_words_)           // W4
+        * sizeof(uint32_t);
+
+    if (pipeCache.hasShader("vsa-bmm-residual") &&
+        logic_buf_.deviceAddress != 0 &&
+        logic_buf_bytes_ >= residual_expected_bytes) {
+        // GPU BDA path: 4-layer residual binary MLP
+        PipelineEntry pipe = pipeCache.getOrCreate(
+            "vsa-bmm-residual", 2, sizeof(VSABMMResidualParams));
+
+        std::vector<VkDescriptorBufferInfo> bufInfos = {
+            {bufInput.handle, 0, stateBytes},
+            {bufOutput.handle, 0, stateBytes},
+        };
+        VkDescriptorSet descSet =
+            pipeCache.allocDescriptorSet("vsa-bmm-residual", bufInfos);
+
+        VSABMMResidualParams push{};
+        push.weights_ptr = logic_buf_.deviceAddress;
+        push.state_words = words_per_vec_;
+        push.hidden_words = hidden_words_;
+        push.num_layers = 4;
+        push._pad = 0;
+
+        batch.begin();
+        batch.dispatch(pipe.pipeline, pipe.layout, descSet, 1, 1, 1,
+                       &push, sizeof(push));
+        batch.submit();
+    } else if (pipeCache.hasShader("vsa-bmm") &&
         logic_buf_.deviceAddress != 0) {
-        // GPU BDA path: 2-layer binary matrix multiply
+        // Fallback: 2-layer binary matrix multiply
         PipelineEntry pipe = pipeCache.getOrCreate(
             "vsa-bmm", 2, sizeof(VSABMMParams));
 

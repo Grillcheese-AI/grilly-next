@@ -79,3 +79,13 @@ model/codebooks/vsa_codebook.bin
 model/student/cubemind_student.bin
 /pretraining
 /tools
+/.serena
+cubemind_student.bin
+/docs/superpowers
+/model/codebooks
+/scripts
+/scripts
+vocab.txt
+/model/student
+/model/codebooks
+model/codebooks/vocab.txt
