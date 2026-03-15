@@ -89,3 +89,8 @@ vocab.txt
 /model/student
 /model/codebooks
 model/codebooks/vocab.txt
+model/codebooks/vocab.txt
+scripts/export_vsa_weights.py
+model/codebooks/vocab.txt
+scripts/get_vocab.py
+scripts/vsa_inference_demo.py
