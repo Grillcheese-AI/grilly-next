@@ -51,7 +51,6 @@ EMB_PATH = str(ROOT / "model" / "codebooks" / "qwen_embeddings.npy")
 
 STATE_DIM = 2048
 HIDDEN_DIM = 1024
-WINDOW = 4
 SEED = 42
 TOKENIZER_MODEL = "Qwen/Qwen2.5-0.5B"
 
@@ -88,26 +87,21 @@ def unpack_bipolar(packed: np.ndarray) -> np.ndarray:
     return result
 
 
-def context_accumulate(
-    codebook_packed: np.ndarray, token_ids: list[int], window: int
-) -> np.ndarray:
-    """Roll + majority-vote bundle over a sliding window of recent tokens.
+def permute_bind_context(codebook_packed: np.ndarray,
+                          token_ids: list[int]) -> np.ndarray:
+    """Build context state via permute-bind chain over all token IDs.
 
-    Uses bitpacked codebook — unpacks only the needed tokens (window=4).
-    Each token vector is circular-shifted by its recency position (most recent
-    token has shift=0), then all are summed and binarized via sign.
+    S_0 = unpack(codebook[tok_0])
+    S_t = roll(S_{t-1}, 1) * unpack(codebook[tok_t])
+
+    Returns bipolar float {-1, +1} vector.
     """
-    recent = token_ids[-window:]
-    dim = codebook_packed.shape[1] * 32
-    acc = np.zeros(dim, dtype=np.float32)
-    for i, tok_id in enumerate(recent):
-        shift = len(recent) - 1 - i  # most recent = shift 0
-        vec = unpack_bipolar(codebook_packed[tok_id])
-        vec = np.roll(vec, shift)
-        acc += vec
-    result = np.sign(acc)
-    result[result == 0] = 1.0
-    return result
+    state = unpack_bipolar(codebook_packed[token_ids[0]])
+    for tok_id in token_ids[1:]:
+        state = np.roll(state, 1)
+        tok_vec = unpack_bipolar(codebook_packed[tok_id])
+        state = state * tok_vec  # bipolar multiply
+    return state
 
 
 def bipolar_to_bitpacked_vec(vec: np.ndarray) -> np.ndarray:
@@ -219,7 +213,7 @@ def main():
 
     assert engine.ready, "Engine failed to initialize — check model files"
     print(f"[READY] state_dim={STATE_DIM}, hidden_dim={HIDDEN_DIM}, "
-          f"vocab={engine.vocab_size:,}, window={WINDOW}")
+          f"vocab={engine.vocab_size:,}, context=permute-bind")
 
     # -- Autoregressive generation ------------------------------------------
 
@@ -231,19 +225,19 @@ def main():
     generated_words = []
     t_start = time.perf_counter()
 
+    # Build initial context from prompt via permute-bind chain
+    state = permute_bind_context(codebook_packed, token_ids)
+
     for step in range(args.max_tokens):
-        # 1. Context accumulation (CPU): roll + majority-vote bundle
-        context_float = context_accumulate(codebook_packed, token_ids, WINDOW)
+        # 1. Bitpack the context state to uint32
+        context_packed = bipolar_to_bitpacked_vec(state)
 
-        # 2. Bitpack the context state to uint32
-        context_packed = bipolar_to_bitpacked_vec(context_float)
-
-        # 3. GPU inference: MLP transform + codebook decode
+        # 2. GPU inference: MLP transform + codebook decode
         result = engine.step(dev, context_packed)
         word = result["word"]
         dist = result["distance"]
 
-        # 4. Print token as it is generated
+        # 3. Print token as it is generated
         print(f"  [{step:3d}] d={dist:5d}  {repr(word)}")
 
         generated_words.append(word)
@@ -251,15 +245,18 @@ def main():
         if word == "<EOS>":
             break
 
-        # 5. Look up the token ID for the predicted word so we can feed it back
-        #    into context accumulation. Search vocab for the word.
+        # 4. Look up the token ID for the predicted word so we can feed it back
         try:
             next_token_id = vocabulary.index(word)
         except ValueError:
-            # If the decoded word is not in vocabulary, use token 0 as fallback
             next_token_id = 0
 
         token_ids.append(next_token_id)
+
+        # 5. Update state: permute then bind with new token (O(1) per token)
+        state = np.roll(state, 1)
+        tok_vec = unpack_bipolar(codebook_packed[next_token_id])
+        state = state * tok_vec
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
@@ -273,7 +270,7 @@ def main():
 
     print(f"\nOutput: {output_text}")
     print(f"\n[STATS] {n_tokens} tokens in {elapsed:.3f}s ({toks_per_sec:.1f} tok/s)")
-    print(f"[STATS] Context window: {WINDOW}, State dim: {STATE_DIM}, "
+    print(f"[STATS] Context: permute-bind (unlimited), State dim: {STATE_DIM}, "
           f"Hidden dim: {HIDDEN_DIM}")
 
 

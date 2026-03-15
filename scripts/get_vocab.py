@@ -1,8 +1,8 @@
 from transformers import AutoTokenizer
 
 # --- Configuration ---
-MODEL_ID = "Qwen/Qwen2.5-72B-Instruct"
-VOCAB_SIZE = 152000
+MODEL_ID = "Qwen/Qwen2.5-32B-Instruct"
+VOCAB_SIZE = 152453
 
 print(f"Downloading tokenizer for {MODEL_ID}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)

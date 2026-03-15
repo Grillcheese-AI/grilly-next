@@ -1,20 +1,22 @@
 """
 Export VSA weights from float {-1,+1} .npz to bitpacked uint32 binary format.
 
-Reads a .npz file containing w1 and w2 bipolar float arrays and packs them
+Reads a .npz file containing w1-w4 bipolar float arrays and packs them
 into the binary format expected by VSABaremetalEngine.load_logic_weights().
 
-Weight layout in output binary file:
-  - w1: hidden_dim x state_words uint32  (e.g., 1024 x 64 for dim=2048)
-  - w2: state_dim  x hidden_words uint32 (e.g., 2048 x 32 for dim=2048)
-  - Both matrices are concatenated contiguously.
+Weight layout in output binary file (4-layer residual MLP):
+  - w1: hidden_dim x state_words uint32  (input -> hidden, 256 KB)
+  - w2: hidden_dim x hidden_words uint32 (hidden -> hidden, 128 KB)
+  - w3: hidden_dim x hidden_words uint32 (hidden -> hidden, 128 KB)
+  - w4: state_dim  x hidden_words uint32 (hidden -> output, 256 KB)
+  - All matrices concatenated contiguously (768 KB total at dim=2048).
 
 Bitpacking convention:
   +1 -> bit 1, -1 -> bit 0
   Bit b of word w corresponds to element w*32 + b.
 
 Usage:
-    python scripts/export_vsa_weights.py --weights model/student/poc_weights.npz --output cubemind_student.bin
+    python scripts/export_vsa_weights.py --weights model/student/poc_weights.npz
 """
 
 import argparse
@@ -58,11 +60,12 @@ def main():
     )
     parser.add_argument(
         "--weights", type=str, required=True,
-        help="Path to .npz file with w1 and w2 keys (bipolar float arrays)",
+        help="Path to .npz file with w1-w4 keys (bipolar float arrays)",
     )
     parser.add_argument(
-        "--output", type=str, required=True,
-        help="Path to output binary file (e.g., cubemind_student.bin)",
+        "--output", type=str,
+        default=str(Path(__file__).parent.parent / "model" / "student" / "cubemind_student.bin"),
+        help="Output binary file path",
     )
     args = parser.parse_args()
 
@@ -77,31 +80,25 @@ def main():
     print(f"Loading weights from {weights_path} ...")
     data = np.load(str(weights_path))
 
-    if "w1" not in data or "w2" not in data:
-        print(f"ERROR: .npz must contain 'w1' and 'w2' keys. Found: {list(data.keys())}")
-        sys.exit(1)
+    keys = ["w1", "w2", "w3", "w4"]
+    for k in keys:
+        if k not in data:
+            print(f"ERROR: .npz missing key '{k}'. Found: {list(data.keys())}")
+            sys.exit(1)
 
-    w1 = data["w1"]  # (hidden_dim, state_dim)
-    w2 = data["w2"]  # (state_dim, hidden_dim)
+    weights = [data[k] for k in keys]
 
-    print(f"  w1 shape: {w1.shape}  (hidden_dim x state_dim)")
-    print(f"  w2 shape: {w2.shape}  (state_dim x hidden_dim)")
+    for k, w in zip(keys, weights):
+        print(f"  {k} shape: {w.shape}")
 
-    hidden_dim, state_dim = w1.shape
-    state_dim_2, hidden_dim_2 = w2.shape
-
-    if state_dim != state_dim_2 or hidden_dim != hidden_dim_2:
-        print(f"ERROR: dimension mismatch — "
-              f"w1 is ({hidden_dim}, {state_dim}), w2 is ({state_dim_2}, {hidden_dim_2})")
-        sys.exit(1)
+    # Infer dimensions from w1 (hidden_dim, state_dim)
+    hidden_dim, state_dim = weights[0].shape
 
     # ── Verify bipolarity ─────────────────────────────────────────────
     def check_bipolar(name: str, arr: np.ndarray):
-        unique = np.unique(arr)
         non_bipolar = np.sum((arr != 1.0) & (arr != -1.0))
         if non_bipolar > 0:
-            print(f"  WARNING: {name} has {non_bipolar} non-bipolar values "
-                  f"(unique sample: {unique[:10]})")
+            print(f"  WARNING: {name} has {non_bipolar} non-bipolar values")
             print(f"  Applying sign() to binarize ...")
             arr = np.sign(arr).astype(np.float32)
             arr[arr == 0] = 1.0
@@ -109,32 +106,26 @@ def main():
             print(f"  {name}: all values are bipolar {{-1, +1}}")
         return arr
 
-    w1 = check_bipolar("w1", w1)
-    w2 = check_bipolar("w2", w2)
+    weights = [check_bipolar(k, w) for k, w in zip(keys, weights)]
 
     # ── Bitpack ───────────────────────────────────────────────────────
     print(f"\nBitpacking ...")
 
-    state_words = state_dim // 32
-    hidden_words = hidden_dim // 32
+    packed = [bitpack_matrix(w) for w in weights]
 
-    w1_packed = bitpack_matrix(w1)  # (hidden_dim, state_words)
-    w2_packed = bitpack_matrix(w2)  # (state_dim, hidden_words)
+    for k, p in zip(keys, packed):
+        print(f"  {k} packed: {p.shape} = {p.nbytes:,d} bytes")
 
-    print(f"  w1 packed: {w1_packed.shape} = {w1_packed.nbytes:,d} bytes "
-          f"({hidden_dim} neurons x {state_words} state_words)")
-    print(f"  w2 packed: {w2_packed.shape} = {w2_packed.nbytes:,d} bytes "
-          f"({state_dim} neurons x {hidden_words} hidden_words)")
-
-    total_bytes = w1_packed.nbytes + w2_packed.nbytes
+    # Concatenate: w1, w2, w3, w4 contiguous
+    combined = np.concatenate([p.ravel() for p in packed])
+    total_bytes = combined.nbytes
     print(f"  Total: {total_bytes:,d} bytes ({total_bytes / 1024:.1f} KB)")
 
     # ── Write binary ──────────────────────────────────────────────────
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "wb") as f:
-        f.write(w1_packed.tobytes())
-        f.write(w2_packed.tobytes())
+        combined.tofile(f)
 
     print(f"\nWritten to {output_path} ({output_path.stat().st_size:,d} bytes)")
     print("Done.")
